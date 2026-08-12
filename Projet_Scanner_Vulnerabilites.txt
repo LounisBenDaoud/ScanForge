@@ -1,0 +1,136 @@
+=============================================================================
+PROJET : SCANNER DE VULNÉRABILITÉS WEB (ARCHITECTURE COMPLÈTE)
+=============================================================================
+
+Ce document est le guide de référence complet de votre projet. Il détaille 
+l'architecture en 3 tiers : un moteur Python (Backend), une API Flask 
+(Middleware), et une interface React (Frontend).
+
+-----------------------------------------------------------------------------
+PRÉREQUIS TECHNIQUES
+-----------------------------------------------------------------------------
+Avant de commencer, assurez-vous d'avoir installé :
+* Python 3.x et les bibliothèques : pip install requests flask flask-cors
+* Node.js (pour lancer l'environnement React/Vite)
+
+-----------------------------------------------------------------------------
+ÉTAPE 1 : ARCHITECTURE DES DOSSIERS
+-----------------------------------------------------------------------------
+Créez un dossier principal "VULNERABILITY_SCANNER" et organisez-le exactement 
+comme ceci :
+
+VULNERABILITY_SCANNER/
+|
++-- database/
+|   +-- models.py          (Script pour créer la base de données SQLite)
+|
++-- backend/
+|   +-- api.py             (Le serveur Flask / API REST)
+|   +-- core/              (Le moteur d'attaque)
+|       +-- recon.py       (Scan passif : En-têtes)
+|       +-- fuzzer.py      (Découverte de contenu : Fuzzing)
+|       +-- payloads.py    (Injection : SQLi & XSS)
+|       +-- wordlist.txt   (Dictionnaire de mots : admin, backup, login...)
+|
++-- frontend/              (Application React générée via Vite)
+
+
+-----------------------------------------------------------------------------
+ÉTAPE 2 : MODÉLISATION DE LA BASE DE DONNÉES (SQLITE)
+-----------------------------------------------------------------------------
+Fichier : database/models.py
+Objectif : Créer le stockage persistant pour l'historique et les failles.
+
+Le script supprime l'ancienne base (si elle existe) et crée trois tables 
+interconnectées :
+1. cibles : Stocke l'URL testée.
+2. scans : Stocke le statut du scan (En cours, Terminé, Erreur) et la date.
+3. vulnerabilites : Stocke les failles trouvées avec 4 niveaux de criticité 
+   (Faible, Moyen, Élevé, Critique), une description, et une remédiation.
+
+
+-----------------------------------------------------------------------------
+ÉTAPE 3 : LE MOTEUR D'ANALYSE (BACKEND CORE)
+-----------------------------------------------------------------------------
+Il s'agit du "cerveau" cybersécurité du projet. Tous ces scripts enregistrent 
+leurs découvertes directement dans la base SQLite.
+
+1. Reconnaissance Passive (backend/core/recon.py)
+   - Action : Analyse les en-têtes HTTP de sécurité du serveur cible 
+     (HSTS, CSP, X-Frame-Options).
+   - Classification : Si un en-tête manque, la faille est enregistrée comme 
+     "Faible".
+
+2. Découverte de Contenu (backend/core/fuzzer.py)
+   - Action : Tente d'accéder à des répertoires cachés en ajoutant les mots 
+     du fichier wordlist.txt à l'URL cible.
+   - Classification : Si le serveur renvoie un code 200 OK ou 403 Forbidden, 
+     le dossier exposé est enregistré comme "Moyen".
+
+3. Exploitation Active (backend/core/payloads.py)
+   - Action : Teste dynamiquement les entrées de l'application web.
+   - Faille XSS : Injecte un script JavaScript. Si le code est reflété, il 
+     enregistre une faille XSS comme "Élevé".
+   - Faille SQLi : Injecte une requête SQL (' OR '1'='1). S'il détecte une 
+     erreur de base de données, il enregistre une faille SQLi comme "Critique".
+
+
+-----------------------------------------------------------------------------
+ÉTAPE 4 : L'API REST (LE PONT FLASK)
+-----------------------------------------------------------------------------
+Fichier : backend/api.py
+Objectif : Permettre à l'interface React de lire la base de données et de 
+déclencher les scripts d'attaque.
+
+Détails des Routes :
+* GET /api/scans : Lit la table "scans" et renvoie l'historique au format JSON.
+* GET /api/stats : Compte le nombre de failles groupées par criticité pour 
+  dessiner le graphique Recharts.
+* POST /api/scan : Reçoit une URL envoyée par l'utilisateur. Utilise le module 
+  "subprocess" et "threading" pour exécuter recon.py, fuzzer.py et payloads.py 
+  en arrière-plan sans bloquer l'application.
+
+
+-----------------------------------------------------------------------------
+ÉTAPE 5 : LE TABLEAU DE BORD SOC (FRONTEND REACT)
+-----------------------------------------------------------------------------
+Initialisation : Dans le dossier racine, lancez :
+"npm create vite@latest frontend -- --template react"
+Puis installez les dépendances : "npm install recharts lucide-react"
+
+Fichier principal : frontend/src/App.jsx
+
+Composants de l'interface :
+1. Barre de Lancement : Un formulaire HTML où l'utilisateur tape une URL. 
+   Au clic sur "Démarrer le Scan", React envoie l'URL à POST /api/scan.
+2. Bouton d'Export PDF : Un bouton appelant window.print() (avec du CSS 
+   @media print pour masquer les boutons inutiles) pour générer un rapport.
+3. Cartes Métriques (KPI) : Trois blocs calculant en direct le Total des Scans, 
+   les Alertes Détectées (somme des failles), et les Scans Terminés.
+4. Graphique Donut (Recharts) : Un graphique circulaire dynamique interrogeant 
+   GET /api/stats pour afficher la proportion de failles (Vert = Faible, 
+   Orange = Moyen, Rouge = Élevé/Critique).
+5. Historique des logs : Une liste détaillée interrogeant GET /api/scans pour 
+   afficher toutes les cibles auditées et leur statut de réussite.
+
+
+-----------------------------------------------------------------------------
+ÉTAPE 6 : PROTOCOLE D'UTILISATION (POUR LA DÉMO DEVANT LE JURY)
+-----------------------------------------------------------------------------
+RÈGLE D'OR : Ne scannez JAMAIS un site au hasard sans autorisation.
+
+1. Démarrage du Backend : Ouvrez un terminal, naviguez dans le dossier 
+   backend et lancez : python api.py (Le serveur tournera sur le port 5000).
+2. Démarrage du Frontend : Ouvrez un second terminal, naviguez dans le dossier 
+   frontend et lancez : npm run dev (L'interface sera sur http://localhost:5173).
+3. Audit en direct : 
+   - Sur l'interface Web, entrez l'URL légale : http://demo.testfire.net
+   - Cliquez sur "Démarrer".
+   - En arrière-plan, Python analyse la cible.
+   - La page React se met à jour, le graphique Donut dessine les nouvelles 
+     vulnérabilités trouvées.
+   - Cliquez sur "Exporter le Rapport" pour générer le PDF de l'audit.
+
+=============================================================================
+FIN DU DOCUMENT
+=============================================================================

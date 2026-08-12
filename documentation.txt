@@ -1,0 +1,60 @@
+# Documentation des Scripts Principaux (Core) du Scanner de Vulnérabilités
+
+Ce document explique le rôle et le fonctionnement des principaux scripts situés dans le dossier `backend/core/`.
+
+## 1. common.py (Fonctions Communes et Base de Données)
+Ce script est le pilier central qui contient toutes les fonctions utilitaires partagées par les autres modules du scanner.
+- **Gestion des URLs :** Fournit des fonctions pour normaliser les adresses web (`normalize_target_url`), déterminer l'origine (`get_origin`) et définir la portée du scan (`get_scope_root`, `same_origin`).
+- **Réseau :** Permet de créer une session HTTP configurée (`build_session`) avec des en-têtes personnalisés (comme un User-Agent spécifique) et de gérer les cookies pour l'authentification.
+- **Base de données :** Contient la logique d'interaction avec la base de données SQLite (fichier `scanner.db`). Il gère la connexion, la création/récupération de la cible, le démarrage/l'arrêt des scans, et surtout, l'ajout des vulnérabilités trouvées via la fonction `add_vulnerability()`.
+
+## 2. recon.py (Reconnaissance Passive)
+Ce module est chargé de la première phase d'analyse non intrusive du site cible.
+- **Analyse des En-têtes HTTP :** Sa fonction principale `analyser_en_tetes()` envoie une requête simple à l'URL cible et vérifie la présence d'en-têtes de sécurité essentiels pour la protection des applications web.
+- **Vulnérabilités ciblées :** Il détecte l'absence de `Strict-Transport-Security` (HSTS), `Content-Security-Policy` (CSP), `X-Frame-Options`, `X-Content-Type-Options`, et `Referrer-Policy`.
+- **Rapport :** Toute configuration manquante est classée avec une sévérité "Faible" et directement enregistrée dans la base de données avec des conseils de remédiation.
+
+## 3. fuzzer.py (Découverte de Contenu Caché)
+Le but de ce script est de trouver des répertoires, des fichiers sensibles ou des chemins d'administration cachés qui ne sont pas référencés publiquement sur le site.
+- **Fuzzing par dictionnaire :** Il utilise une liste de mots-clés (fichier `wordlist.txt`) pour tester systématiquement de nombreux chemins potentiels (ex: `/admin`, `/.env`, `/backup.zip`).
+- **Gestion Intelligente des Faux Positifs :** Pour contourner les serveurs qui renvoient des codes "200 OK" même quand une page n'existe pas (Custom 404), il génère d'abord une requête vers une page aléatoire ("baseline"). Ensuite, il compare les réponses trouvées avec cette baseline pour s'assurer que la découverte est bien un chemin unique et valide.
+- **Classification :** Si un fichier hautement sensible (comme `.env` ou `.sql`) est accessible publiquement, la vulnérabilité sera classée "Élevée". Les autres répertoires intéressants seront classés "Moyen" ou "Faible".
+
+## 4. payloads.py (Tests d'Injections XSS et SQL)
+C'est le module le plus complexe et offensif, conçu pour simuler des attaques d'injection de code sur l'application web.
+- **Crawling et Découverte de Paramètres :** Il possède un parseur HTML personnalisé (`FormAndLinkParser`) qui va analyser les pages pour extraire tous les formulaires, champs d'entrée, et paramètres d'URLs afin de déterminer où injecter des charges utiles (payloads).
+- **Test Cross-Site Scripting (XSS) :** Il injecte des payloads JavaScript spécifiques et analyse la réponse HTTP du serveur. S'il retrouve son payload réfléchi tel quel sans encodage sécurisé, il rapporte une faille XSS Réfléchie.
+- **Test d'Injection SQL (SQLi) :** Il tente de manipuler les requêtes SQL en base de données selon deux techniques :
+  1. *Error-based SQLi :* Injection de caractères provoquant la casse de la requête (comme les guillemets simples `'`) pour déceler des messages d'erreur de base de données visibles publiquement.
+  2. *Boolean-based Blind SQLi :* En l'absence de messages d'erreur explicites, il va envoyer des expressions booléennes vraies puis fausses (ex: `OR 1=1` vs `AND 1=2`) et analyser les différences de comportement de la page (nombre de résultats, différence de contenu/statut HTTP) pour prouver l'injection.
+
+
+
+  ## start the dvwa 
+  docker run --rm -it -p 80:80 vulnerables/web-dvwa
+
+  ## the web app dvwa
+  http://localhost/vulnerabilities/sqli/?id=1&Submit=Submit
+
+
+  ## start the OWASP Juice Shop (modern test environment)
+  docker run -d --name juice-shop -p 3000:3000 bkimminich/juice-shop
+
+  ## stop / remove Juice Shop
+  docker stop juice-shop
+  docker rm juice-shop
+
+  ## Juice Shop URL
+  http://localhost:3000
+
+  ## Juice Shop - Recommended endpoints to test with the scanner
+  # recon.py (HTTP headers):
+  http://localhost:3000
+
+  # fuzzer.py (hidden paths):
+  http://localhost:3000
+
+  # payloads.py (XSS / SQLi):
+  http://localhost:3000/#/search?q=test          <-- reflected XSS via search param
+  http://localhost:3000/rest/products/search?q=  <-- SQLi via REST API search
+  http://localhost:3000/#/login                  <-- SQLi auth bypass (email field)

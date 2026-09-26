@@ -1,624 +1,390 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from "react";
-import { Crosshair } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import logo from "./assets/logo.png";
 
 const API = "http://127.0.0.1:5000";
 
-// ── Severity ──────────────────────────────────────────────────────────
-const SEV_COLORS = {
-  Critique: "#E5484D",
-  Élevé:    "#F0A83C",
-  Moyen:    "#F0A83C",
-  Faible:   "#5FD0C0",
+const SEVERITIES = [
+  { key: "Critique", label: "Critique", color: "#B42318", background: "#FEE4E2" },
+  { key: "Élevé", label: "Élevée", color: "#B54708", background: "#FFE6C7" },
+  { key: "Moyen", label: "Moyenne", color: "#92720B", background: "#FDF3C7" },
+  { key: "Faible", label: "Faible", color: "#344054", background: "#EEF1F5" },
+];
+
+const PDF_SEVERITIES = {
+  Critique: { label: "CRITIQUE", color: "#991b1b", background: "#fef2f2", border: "#fca5a5" },
+  "Élevé": { label: "ÉLEVÉE", color: "#9a3412", background: "#fff7ed", border: "#fdba74" },
+  Moyen: { label: "MOYENNE", color: "#854d0e", background: "#fefce8", border: "#fde047" },
+  Faible: { label: "FAIBLE", color: "#166534", background: "#f0fdf4", border: "#86efac" },
 };
 
-const SEV_CLS = {
-  Critique: "crit",
-  Élevé:    "high",
-  Moyen:    "med",
-  Faible:   "low",
+const normalizeSeverity = (value = "") => {
+  const clean = value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+  if (clean.includes("crit")) return "Critique";
+  if (clean.includes("elev")) return "Élevé";
+  if (clean.includes("moy")) return "Moyen";
+  return "Faible";
 };
 
-const SEV_LABELS = {
-  Critique: "CRITIQUE",
-  Élevé:    "ÉLEVÉ",
-  Moyen:    "MOYEN",
-  Faible:   "FAIBLE",
+const severitySlug = (value) => normalizeSeverity(value).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+
+const countBySeverity = (findings = []) => findings.reduce((counts, finding) => {
+  counts[normalizeSeverity(finding.criticite)] += 1;
+  return counts;
+}, { Critique: 0, "Élevé": 0, Moyen: 0, Faible: 0 });
+
+const calculateExposure = (findings = []) => {
+  const counts = countBySeverity(findings);
+  return Math.min(100, counts.Critique * 28 + counts["Élevé"] * 16 + counts.Moyen * 8 + counts.Faible * 3);
 };
 
-// Print-only severity data (preserved for PDF report)
-const SEV = {
-  Critique: { cls: "crit", label: "CRITIQUE", color: "#f87171", printBg: "#fef2f2", printColor: "#991b1b", printBorder: "#fca5a5" },
-  Élevé:    { cls: "high", label: "ÉLEVÉ",    color: "#fb923c", printBg: "#fff7ed", printColor: "#9a3412", printBorder: "#fdba74" },
-  Moyen:    { cls: "med",  label: "MOYEN",    color: "#fbbf24", printBg: "#fefce8", printColor: "#854d0e", printBorder: "#fde047" },
-  Faible:   { cls: "low",  label: "FAIBLE",   color: "#34d399", printBg: "#f0fdf4", printColor: "#166534", printBorder: "#86efac" },
-};
-const SEV_ORDER = ["Critique", "Élevé", "Moyen", "Faible"];
-const getSev = (s) => SEV[s] ?? SEV.Faible;
-
-const countBySev = (vulns = []) =>
-  SEV_ORDER.reduce((acc, s) => ({ ...acc, [s]: vulns.filter((v) => v.criticite === s).length }), {});
-
-// ── Score ──────────────────────────────────────────────────────────
-const calcSecurityScore = (vulns = []) => {
-  if (!vulns.length) return 100;
-  const c = countBySev(vulns);
-  const penalty = c.Critique * 25 + c["Élevé"] * 15 + c.Moyen * 8 + c.Faible * 3;
-  return Math.max(0, Math.min(100, 100 - penalty));
+const formatDate = (value, withTime = false) => {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("fr-FR", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    ...(withTime ? { hour: "2-digit", minute: "2-digit" } : {}),
+  }).format(date);
 };
 
-const getRiskVerdict = (vulns = []) => {
-  const c = countBySev(vulns);
-  if (c.Critique > 0) return { level: "CRITIQUE", color: "#991b1b", bg: "#fef2f2", border: "#fca5a5" };
-  if (c["Élevé"] > 0) return { level: "ÉLEVÉ", color: "#9a3412", bg: "#fff7ed", border: "#fdba74" };
-  if (c.Moyen > 0)    return { level: "MOYEN", color: "#854d0e", bg: "#fefce8", border: "#fde047" };
-  if (c.Faible > 0)   return { level: "FAIBLE", color: "#166534", bg: "#f0fdf4", border: "#86efac" };
-  return { level: "AUCUN", color: "#166534", bg: "#f0fdf4", border: "#86efac" };
-};
+function SeverityTag({ value }) {
+  const normalized = normalizeSeverity(value);
+  const definition = SEVERITIES.find((severity) => severity.key === normalized) ?? SEVERITIES[3];
+  return <span className={`severity-tag severity-tag--${severitySlug(normalized)}`}>{definition.label}</span>;
+}
 
-// ── SVG dial helpers ──────────────────────────────────────────────
-const CX = 150, CY = 145, R = 110;
-const valToAngle = (v) => Math.PI * (1 - v / 100); // 0→π(left), 100→0(right)
-
-const polarXY = (cx, cy, r, rad) => ({
-  x: cx + r * Math.cos(rad),
-  y: cy - r * Math.sin(rad),
-});
-
-const arcD = (startVal, endVal, radius = R) => {
-  const a1 = valToAngle(startVal);
-  const a2 = valToAngle(endVal);
-  const p1 = polarXY(CX, CY, radius, a1);
-  const p2 = polarXY(CX, CY, radius, a2);
-  const large = Math.abs(a1 - a2) > Math.PI ? 1 : 0;
-  return `M ${p1.x} ${p1.y} A ${radius} ${radius} 0 ${large} 0 ${p2.x} ${p2.y}`;
-};
-
-// ── Waveform Component ────────────────────────────────────────────
-function Waveform({ isScanning }) {
-  const canvasRef = useRef(null);
-  const animRef = useRef(null);
-  const timeRef = useRef(0);
+function DonutChart({ counts }) {
+  const [ready, setReady] = useState(false);
+  const total = SEVERITIES.reduce((sum, severity) => sum + counts[severity.key], 0);
+  const radius = 52;
+  const circumference = 2 * Math.PI * radius;
+  let offset = 0;
 
   useEffect(() => {
-    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-
-    const draw = () => {
-      const rect = canvas.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = rect.width * dpr;
-      canvas.height = rect.height * dpr;
-      ctx.scale(dpr, dpr);
-      const w = rect.width;
-      const h = rect.height;
-
-      ctx.clearRect(0, 0, w, h);
-
-      // Vertical grid lines
-      ctx.strokeStyle = "rgba(232,228,216,0.04)";
-      ctx.lineWidth = 1;
-      for (let x = 0; x < w; x += 32) {
-        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
-      }
-      // Horizontal center line
-      ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
-
-      // Trace
-      const amp = isScanning ? h * 0.32 : h * 0.1;
-      const freq = isScanning ? 0.018 : 0.005;
-      const cy = h / 2;
-
-      ctx.beginPath();
-      ctx.strokeStyle = "#5FD0C0";
-      ctx.lineWidth = 1.5;
-      ctx.shadowColor = "rgba(95,208,192,0.4)";
-      ctx.shadowBlur = 6;
-
-      for (let x = 0; x < w; x++) {
-        const noise = isScanning ? (Math.random() - 0.5) * h * 0.06 : 0;
-        const y = cy + Math.sin(x * freq + timeRef.current) * amp + noise;
-        x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-      }
-      ctx.stroke();
-      ctx.shadowBlur = 0;
-
-      if (!reducedMotion) {
-        timeRef.current += isScanning ? 0.07 : 0.015;
-        animRef.current = requestAnimationFrame(draw);
-      }
-    };
-
-    draw();
-    return () => { if (animRef.current) cancelAnimationFrame(animRef.current); };
-  }, [isScanning]);
-
-  return <canvas ref={canvasRef} className="waveform-canvas" />;
-}
-
-// ── Exposure Dial Component ───────────────────────────────────────
-function ExposureDial({ exposure, hasData }) {
-  // exposure: 0 = safe, 100 = fully exposed
-  const needleRad = hasData ? valToAngle(exposure) : valToAngle(0);
-  const needleDeg = hasData ? -90 + (exposure / 100) * 180 : -90;
-
-  // Tick marks at 0, 25, 50, 75, 100
-  const ticks = [0, 25, 50, 75, 100].map((v) => {
-    const rad = valToAngle(v);
-    const inner = polarXY(CX, CY, R - 8, rad);
-    const outer = polarXY(CX, CY, R + 6, rad);
-    const label = polarXY(CX, CY, R + 18, rad);
-    return { v, inner, outer, label };
-  });
+    const frame = window.requestAnimationFrame(() => setReady(true));
+    return () => window.cancelAnimationFrame(frame);
+  }, [counts]);
 
   return (
-    <svg className="dial-svg" viewBox="0 0 300 190">
-      {/* Zone arcs */}
-      <path d={arcD(0, 40)} fill="none" stroke="#5FD0C0" strokeWidth="6" strokeLinecap="round" opacity="0.35" />
-      <path d={arcD(40, 75)} fill="none" stroke="#F0A83C" strokeWidth="6" strokeLinecap="round" opacity="0.35" />
-      <path d={arcD(75, 100)} fill="none" stroke="#E5484D" strokeWidth="6" strokeLinecap="round" opacity="0.35" />
-
-      {/* Track arc (thin) */}
-      <path d={arcD(0, 100, R - 14)} fill="none" stroke="rgba(232,228,216,0.06)" strokeWidth="1" />
-
-      {/* Tick marks */}
-      {ticks.map((t) => (
-        <g key={t.v}>
-          <line x1={t.inner.x} y1={t.inner.y} x2={t.outer.x} y2={t.outer.y}
-            stroke="rgba(232,228,216,0.2)" strokeWidth="1" />
-          <text x={t.label.x} y={t.label.y} textAnchor="middle" dominantBaseline="middle"
-            className="dial-tick-label">{t.v}</text>
-        </g>
-      ))}
-
-      {/* Needle */}
-      <g className="dial-needle" style={{ transform: `rotate(${needleDeg}deg)` }}>
-        <line x1={CX} y1={CY} x2={CX} y2={CY - R + 16}
-          stroke={hasData ? (exposure >= 75 ? "#E5484D" : exposure >= 40 ? "#F0A83C" : "#5FD0C0") : "rgba(232,228,216,0.15)"}
-          strokeWidth="2" strokeLinecap="round" />
-        <circle cx={CX} cy={CY} r="4"
-          fill={hasData ? (exposure >= 75 ? "#E5484D" : exposure >= 40 ? "#F0A83C" : "#5FD0C0") : "rgba(232,228,216,0.15)"} />
-      </g>
-
-      {/* Center number */}
-      <text x={CX} y={CY + 30} textAnchor="middle" className="dial-number">
-        {hasData ? (100 - exposure) : "—"}
-      </text>
-      <text x={CX} y={CY + 46} textAnchor="middle" className="dial-unit">
-        exposition
-      </text>
-    </svg>
-  );
-}
-
-// ── Stat Readout ──────────────────────────────────────────────────
-function StatReadout({ label, value, max, variant }) {
-  const pct = max > 0 ? Math.min((value / max) * 100, 100) : 0;
-  return (
-    <div className="stat-readout">
-      <span className="stat-label">{label}</span>
-      <span className={`stat-value ${variant ? `stat-value--${variant}` : ""}`}>{value}</span>
-      <div className="stat-bar">
-        <div
-          className={`stat-bar-fill ${variant === "amber" ? "stat-bar-fill--amber" : ""}`}
-          style={{ width: `${pct}%` }}
-        />
+    <div className="donut-wrap">
+      <div className="donut-chart">
+        <svg viewBox="0 0 132 132" role="img" aria-label={`${total} vulnérabilités détectées`}>
+          <circle className="donut-track" cx="66" cy="66" r={radius} />
+          {total > 0 && SEVERITIES.map((severity) => {
+            const length = (counts[severity.key] / total) * circumference;
+            const dashOffset = -offset;
+            offset += length;
+            return (
+              <circle
+                className="donut-segment"
+                key={severity.key}
+                cx="66"
+                cy="66"
+                r={radius}
+                stroke={severity.color}
+                strokeDasharray={`${ready ? Math.max(length - 2, 0) : 0} ${circumference}`}
+                strokeDashoffset={dashOffset}
+              />
+            );
+          })}
+        </svg>
+        <div className="donut-total"><strong>{total}</strong><span>résultats</span></div>
+      </div>
+      <div className="donut-legend">
+        {SEVERITIES.map((severity) => (
+          <div className="legend-item" key={severity.key}>
+            <span className="legend-dot" style={{ backgroundColor: severity.color }} />
+            <span>{severity.label}</span>
+            <strong>{counts[severity.key]}</strong>
+          </div>
+        ))}
       </div>
     </div>
   );
 }
 
-// ── Section Label ─────────────────────────────────────────────────
-function SectionLabel({ children }) {
+function PdfReport({ scan, findings, counts }) {
+  if (!scan) return <div className="print-only"><div className="rpt-empty">Aucune analyse disponible.</div></div>;
+
+  const riskKey = counts.Critique > 0 ? "Critique"
+    : counts["Élevé"] > 0 ? "Élevé"
+    : counts.Moyen > 0 ? "Moyen"
+    : counts.Faible > 0 ? "Faible"
+    : null;
+  const risk = riskKey ? PDF_SEVERITIES[riskKey] : { label: "AUCUN", color: "#166534", background: "#f0fdf4", border: "#86efac" };
+  const maxCount = Math.max(...SEVERITIES.map((severity) => counts[severity.key]), 1);
+  const exportDate = new Date().toLocaleDateString("fr-FR", { day: "2-digit", month: "long", year: "numeric" });
+
   return (
-    <div className="section-label">
-      <span className="section-tick" />
-      {children}
+    <div className="print-only">
+      <div className="rpt">
+        <div className="rpt-cover">
+          <div className="rpt-cover-top">
+            <div className="rpt-cover-shield">🛡</div>
+            <div>
+              <h1 className="rpt-cover-title">RAPPORT D’AUDIT DE SÉCURITÉ WEB</h1>
+              <p className="rpt-cover-subtitle">ScanForge — Rapport généré automatiquement</p>
+            </div>
+          </div>
+          <div className="rpt-cover-meta">
+            <div className="rpt-cover-meta-item"><span className="rpt-cover-meta-label">CIBLE AUDITÉE</span><span className="rpt-cover-meta-value">{scan.url}</span></div>
+            <div className="rpt-cover-meta-item"><span className="rpt-cover-meta-label">DATE DU SCAN</span><span className="rpt-cover-meta-value">{formatDate(scan.date, true)}</span></div>
+            <div className="rpt-cover-meta-item"><span className="rpt-cover-meta-label">DATE D’EXPORT</span><span className="rpt-cover-meta-value">{exportDate}</span></div>
+          </div>
+        </div>
+
+        <div className="rpt-executive">
+          <h2 className="rpt-executive-title">Synthèse Exécutive</h2>
+          <div className="rpt-executive-grid">
+            <div className="rpt-risk-verdict" style={{ background: risk.background, borderColor: risk.border }}>
+              <span className="rpt-risk-verdict-label" style={{ color: risk.color }}>NIVEAU DE RISQUE</span>
+              <span className="rpt-risk-verdict-level" style={{ color: risk.color }}>{risk.label}</span>
+              <span className="rpt-risk-verdict-count" style={{ color: risk.color }}>{findings.length} vulnérabilité{findings.length === 1 ? "" : "s"} identifiée{findings.length === 1 ? "" : "s"}</span>
+            </div>
+            <div className="rpt-meter-wrap">
+              {SEVERITIES.map((severity) => {
+                const definition = PDF_SEVERITIES[severity.key];
+                const count = counts[severity.key];
+                const percentage = (count / maxCount) * 100;
+                return (
+                  <div className="rpt-meter-row" key={severity.key}>
+                    <span className="rpt-meter-label" style={{ color: definition.color }}>{definition.label}</span>
+                    <div className="rpt-meter-bar-bg"><div className="rpt-meter-bar-fill" style={{ width: `${count ? Math.max(percentage, 5) : 0}%`, background: definition.color }} /></div>
+                    <span className="rpt-meter-count" style={{ color: definition.color }}>{count}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        <div className="rpt-block">
+          <h2 className="rpt-block-title">Résumé par Criticité</h2>
+          <div className="rpt-summary">
+            {SEVERITIES.map((severity) => {
+              const definition = PDF_SEVERITIES[severity.key];
+              return (
+                <div className="rpt-sev-item" key={severity.key} style={{ background: definition.background, borderColor: definition.border }}>
+                  <span className="rpt-sev-label" style={{ color: definition.color }}>{definition.label}</span>
+                  <span className="rpt-sev-count" style={{ color: definition.color }}>{counts[severity.key]}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="rpt-block">
+          <h2 className="rpt-block-title">Détail des Vulnérabilités</h2>
+          {findings.length === 0 ? <p className="rpt-no-vuln">Aucune vulnérabilité détectée lors de cet audit.</p> : findings.map((finding, index) => {
+            const definition = PDF_SEVERITIES[normalizeSeverity(finding.criticite)];
+            return (
+              <div className="rpt-vuln" key={finding.id ?? `${finding.type}-${index}`} style={{ borderLeftColor: definition.color }}>
+                <div className="rpt-vuln-header">
+                  <span className="rpt-vuln-num">{index + 1}</span>
+                  <span className="rpt-badge" style={{ background: definition.background, color: definition.color, borderColor: definition.border }}>{definition.label}</span>
+                  <h3 className="rpt-vuln-title">{finding.type}</h3>
+                </div>
+                <div className="rpt-vuln-body">
+                  <div className="rpt-desc-body"><h4 className="rpt-vuln-section-title rpt-desc-title">Description</h4><p className="rpt-vuln-text">{finding.description}</p></div>
+                  <div className="rpt-reco"><h4 className="rpt-vuln-section-title rpt-reco-title">Recommandation</h4><p className="rpt-vuln-text">{finding.remediation}</p></div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="rpt-footer">
+          <div className="rpt-footer-line"><p>CONFIDENTIEL</p><span className="rpt-footer-dot" /><p>ScanForge</p><span className="rpt-footer-dot" /><p>{exportDate}</p></div>
+          <p className="rpt-footer-notice">Ce rapport est confidentiel et destiné exclusivement à l’équipe de sécurité mandatée. Toute reproduction ou divulgation non autorisée est interdite.</p>
+        </div>
+      </div>
     </div>
   );
 }
 
-// ── Main App ──────────────────────────────────────────────────────
 function App() {
   const [scans, setScans] = useState([]);
-  const [loading, setLoading] = useState(true);
   const [lastScan, setLastScan] = useState(null);
-
+  const [loading, setLoading] = useState(true);
   const [url, setUrl] = useState("");
   const [cookieHeader, setCookieHeader] = useState("");
-  const [securityLevel, setSecurityLevel] = useState("");
+  const [securityLevel, setSecurityLevel] = useState("standard");
   const [authorized, setAuthorized] = useState(false);
-  const [scanStatus, setScanStatus] = useState(null); // null | "loading" | "success" | "error"
-  const [scanMsg, setScanMsg] = useState("");
-  const [checkboxFlash, setCheckboxFlash] = useState(false);
+  const [scanStatus, setScanStatus] = useState(null);
+  const [scanMessage, setScanMessage] = useState("");
   const pollRef = useRef(null);
 
-  // ── Derived ──────────────────────────────────────────────────
-  const totalScans = scans.length;
-  const completedScans = scans.filter((s) => s.statut === "Terminé").length;
-  const vulns = lastScan?.vulnerabilities ?? [];
-  const totalAlerts = vulns.length;
-  const securityScore = useMemo(() => calcSecurityScore(vulns), [vulns]);
-  const exposure = 100 - securityScore;
-  const hasData = lastScan !== null && vulns.length > 0;
+  const findings = useMemo(() => lastScan?.vulnerabilities ?? [], [lastScan]);
+  const counts = useMemo(() => countBySeverity(findings), [findings]);
+  const exposure = useMemo(() => calculateExposure(findings), [findings]);
+  const completedScans = scans.filter((scan) => String(scan.statut).toLowerCase().includes("termin")).length;
+  const securityScore = lastScan ? 100 - exposure : 0;
 
-  // ── Fetch ────────────────────────────────────────────────────
   const fetchData = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const [scansRes, lastRes] = await Promise.all([
+      const [scansResponse, lastResponse] = await Promise.all([
         fetch(`${API}/api/scans`),
         fetch(`${API}/api/last-scan`),
       ]);
-      const [scansData, lastData] = await Promise.all([scansRes.json(), lastRes.json()]);
+      if (!scansResponse.ok || !lastResponse.ok) throw new Error("Le service d’analyse ne répond pas.");
+      const [scansPayload, lastPayload] = await Promise.all([scansResponse.json(), lastResponse.json()]);
 
-      if (scansData.status === "success") {
-        setScans(scansData.data);
-        const hasRunning = scansData.data.some((s) => s.statut === "En cours");
-        if (!hasRunning && pollRef.current) {
+      if (scansPayload.status === "success") {
+        const nextScans = scansPayload.data ?? [];
+        setScans(nextScans);
+        const running = nextScans.some((scan) => String(scan.statut).toLowerCase().includes("cours"));
+        if (!running && pollRef.current) {
           clearInterval(pollRef.current);
           pollRef.current = null;
           setScanStatus(null);
         }
       }
-      if (lastData.status === "success") setLastScan(lastData.data);
-    } catch (err) {
-      console.error("API unreachable:", err);
+      if (lastPayload.status === "success") setLastScan(lastPayload.data);
+    } catch (error) {
+      if (!silent) setScanMessage(error.message);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
-    const t = setTimeout(() => fetchData(), 0);
-    return () => { clearTimeout(t); if (pollRef.current) clearInterval(pollRef.current); };
+    const initialFetch = window.setTimeout(fetchData, 0);
+    return () => {
+      window.clearTimeout(initialFetch);
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
   }, [fetchData]);
 
-  // ── Scan ─────────────────────────────────────────────────────
-  const handleScan = async (e) => {
-    e.preventDefault();
-    if (!url) return;
+  const handleScan = async (event) => {
+    event.preventDefault();
     if (!authorized) {
-      // Flash checkbox amber
-      setCheckboxFlash(true);
-      setTimeout(() => setCheckboxFlash(false), 1200);
+      setScanMessage("Confirmez votre autorisation avant de lancer l’analyse.");
       return;
     }
+
     setScanStatus("loading");
-    setScanMsg("Connexion au backend, initialisation de l'audit…");
+    setScanMessage("Analyse en cours. Les résultats seront actualisés automatiquement.");
     try {
-      const res = await fetch(`${API}/api/scan`, {
+      const response = await fetch(`${API}/api/scan`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url, confirmAuthorized: authorized, cookieHeader: cookieHeader || "", securityLevel: securityLevel || "" }),
+        body: JSON.stringify({
+          url: url.trim(),
+          confirmAuthorized: authorized,
+          cookieHeader: cookieHeader.trim(),
+          securityLevel,
+        }),
       });
-      const data = await res.json();
-      if (data.status === "success") {
-        setScanStatus("success");
-        setScanMsg(data.message);
-        if (pollRef.current) clearInterval(pollRef.current);
-        pollRef.current = setInterval(() => fetchData(true), 5000);
-        setTimeout(() => fetchData(true), 3000);
-      } else {
-        setScanStatus("error");
-        setScanMsg(data.message || "Erreur inconnue.");
-      }
-    } catch {
+      const payload = await response.json();
+      if (!response.ok || payload.status !== "success") throw new Error(payload.message || "Impossible de lancer l’analyse.");
+      setScanStatus("success");
+      setScanMessage("Analyse lancée avec succès.");
+      if (pollRef.current) clearInterval(pollRef.current);
+      pollRef.current = setInterval(() => fetchData(true), 5000);
+      window.setTimeout(() => fetchData(true), 2500);
+    } catch (error) {
       setScanStatus("error");
-      setScanMsg("Impossible de joindre le backend. Vérifiez que python API.py est lancé.");
+      setScanMessage(error.message);
     }
   };
 
-  // ── Button label ──────────────────────────────────────────────
-  const btnLabel = scanStatus === "loading" ? "SCAN EN COURS…"
-    : (scanStatus === "success" || scanStatus === null) && lastScan ? "NOUVEAU SCAN"
-    : "LANCER LE SCAN";
+  const recentScans = scans.slice(0, 6);
 
-  // ── Format log timestamp ─────────────────────────────────────
-  const fmtTime = (dateStr, idx) => {
-    try {
-      const d = new Date(dateStr);
-      const h = String(d.getHours()).padStart(2, "0");
-      const m = String(d.getMinutes()).padStart(2, "0");
-      const s = String(Math.min(59, d.getSeconds() + idx)).toString().padStart(2, "0");
-      return `${h}:${m}:${s}`;
-    } catch { return "——:——"; }
-  };
-
-  // ── Loading screen ────────────────────────────────────────────
-  if (loading) {
-    return (
-      <div className="loading-screen">
-        <div className="loading-mark"><Crosshair size={32} /></div>
-        <span className="loading-text">Initialisation du système…</span>
-        <div className="loading-bar"><div className="loading-bar-fill" /></div>
-      </div>
-    );
-  }
-
-  // ── Render ────────────────────────────────────────────────────
   return (
-    <div>
-      <div className="screen-only">
-        <div className="console-layout">
-
-          {/* ── Console Rail ──────────────────────────────────── */}
-          <aside className="console-rail">
-            {/* Brand */}
-            <div className="console-brand">
-              <div className="brand-mark"><Crosshair size={20} /></div>
-              <div>
-                <div className="brand-wordmark">Vulnerability Scanner</div>
-                <div className="brand-version">v2.0 · diagnostic console</div>
-              </div>
-            </div>
-
-            {/* Status */}
-            <div className="console-status">
-              <span className="status-dot" />
-              Système actif
-            </div>
-            <div className="console-divider" />
-
-            {/* Form */}
-            <form className="console-form" onSubmit={handleScan}>
-              <div>
-                <label className="field-label" htmlFor="target-url">Cible</label>
-                <input id="target-url" className="field" type="text"
-                  placeholder="https://cible-autorisée.com"
-                  value={url} onChange={(e) => setUrl(e.target.value)} />
-              </div>
-              <div>
-                <label className="field-label" htmlFor="cookie">Cookie de session</label>
-                <input id="cookie" className="field" type="text"
-                  placeholder="ex: PHPSESSID=abc123"
-                  value={cookieHeader} onChange={(e) => setCookieHeader(e.target.value)} />
-              </div>
-              <div>
-                <label className="field-label" htmlFor="sec-level">Niveau de sécurité</label>
-                <select id="sec-level" className="field"
-                  value={securityLevel} onChange={(e) => setSecurityLevel(e.target.value)}>
-                  <option value="">Par défaut</option>
-                  <option value="low">Low</option>
-                  <option value="medium">Medium</option>
-                  <option value="high">High</option>
-                </select>
-              </div>
-
-              <div className="console-divider" />
-
-              {/* Authorization */}
-              <label className="auth-row">
-                <input type="checkbox" className="auth-checkbox"
-                  checked={authorized} onChange={(e) => setAuthorized(e.target.checked)}
-                  data-flash={checkboxFlash || undefined} />
-                <span className="auth-text">
-                  Je confirme être autorisé à scanner cette cible.
-                </span>
-              </label>
-              <p className="auth-warn">
-                Utilisez uniquement sur des cibles dont vous avez l'autorisation explicite. Le scanner ne peut pas vérifier automatiquement vos droits.
-              </p>
-
-              <div className="console-divider" />
-
-              {/* Buttons */}
-              <button type="submit" className="btn btn--primary"
-                disabled={scanStatus === "loading" || !url}>
-                {scanStatus === "loading" && <span className="spinner" />}
-                {btnLabel}
-              </button>
-              <button type="button" className="btn btn--secondary"
-                onClick={() => window.print()} disabled={!lastScan}>
-                Exporter le rapport
-              </button>
-
-              {/* Scan message */}
-              {scanMsg && (
-                <div className={`scan-msg scan-msg--${scanStatus}`}>
-                  {scanMsg}
-                </div>
-              )}
-            </form>
-
-            {/* Footer */}
-            <div className="console-footer">
-              Scanner de Vulnérabilités Web © 2026 — Usage éthique uniquement. Toute utilisation non autorisée est illégale.
-            </div>
-          </aside>
-
-          {/* ── Main Area ─────────────────────────────────────── */}
-          <main className="main-area">
-            <div className="hud-frame" aria-hidden="true" />
-
-            {/* Panel 1 — Activity Waveform */}
-            <section className="panel panel-waveform">
-              <SectionLabel>Trace d'activité</SectionLabel>
-              <Waveform isScanning={scanStatus === "loading"} />
-            </section>
-
-            {/* Panel 2 — Dial + Stats */}
-            <section className="panel panel-dial-stats">
-              <div className="dial-section">
-                <SectionLabel>Indice d'exposition</SectionLabel>
-                <ExposureDial exposure={exposure} hasData={hasData} />
-              </div>
-              <div className="stats-section">
-                <StatReadout label="Scans" value={totalScans}
-                  max={Math.max(totalScans, 1)} />
-                <StatReadout label="Alertes" value={totalAlerts}
-                  max={Math.max(totalAlerts, 1)} variant={totalAlerts > 0 ? "amber" : undefined} />
-                <StatReadout label="Terminés" value={completedScans}
-                  max={Math.max(totalScans, 1)} />
-              </div>
-            </section>
-
-            {/* Panel 3 — Detections Log */}
-            <section className="panel panel-log">
-              <SectionLabel>Journal des détections</SectionLabel>
-              <div className="log-body">
-                {vulns.length === 0 ? (
-                  <div className="log-idle">
-                    <span className="log-cursor" />
-                    <span>SYSTÈME — en attente d'une cible. Lancez un scan pour amorcer le journal.</span>
-                  </div>
-                ) : (
-                  vulns.map((v, i) => {
-                    const cls = SEV_CLS[v.criticite] ?? "low";
-                    return (
-                      <div key={v.id || i} className="log-row" style={{ animationDelay: `${i * 80}ms` }}>
-                        <span className="log-time">{fmtTime(lastScan?.date, i)}</span>
-                        <span className={`log-tick log-tick--${cls}`} />
-                        <span className="log-name">{v.type}</span>
-                        <span className={`log-sev log-sev--${cls}`}>{SEV_LABELS[v.criticite] ?? "FAIBLE"}</span>
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-            </section>
-          </main>
+    <>
+    <div className="app-shell">
+      <header className="topbar">
+        <div className="topbar-inner">
+          <div className="brand">
+            <img className="brand-logo" src={logo} alt="" />
+            <strong>ScanForge</strong>
+          </div>
         </div>
-      </div>
+      </header>
 
-      {/* ════════════════ PDF REPORT (print only) ════════════════ */}
-      <div className="print-only">
-        {!lastScan ? (
-          <div className="rpt-empty">
-            <p>Aucun audit disponible. Lancez un scan pour générer un rapport.</p>
+      <main className="content">
+        <div className="page-heading">
+          <div><h1>Analyse de sécurité</h1></div>
+          <div className="page-actions">
+            <span className="last-update">Dernière mise à jour&nbsp;: <b>{lastScan ? formatDate(lastScan.date, true) : "aucune analyse"}</b></span>
+            <button className="export-button" type="button" onClick={() => window.print()} disabled={!lastScan}>Exporter en PDF</button>
           </div>
-        ) : (
-          <div className="rpt">
-            {/* Cover Header */}
-            <div className="rpt-cover">
-              <div className="rpt-cover-top">
-                <div className="rpt-cover-shield">🛡</div>
-                <div>
-                  <h1 className="rpt-cover-title">RAPPORT D'AUDIT DE SÉCURITÉ WEB</h1>
-                  <p className="rpt-cover-subtitle">Vulnerability Scanner v2.0 — Rapport généré automatiquement</p>
-                </div>
-              </div>
-              <div className="rpt-cover-meta">
-                <div className="rpt-cover-meta-item">
-                  <span className="rpt-cover-meta-label">CIBLE AUDITÉE</span>
-                  <span className="rpt-cover-meta-value">{lastScan.url}</span>
-                </div>
-                <div className="rpt-cover-meta-item">
-                  <span className="rpt-cover-meta-label">DATE DU SCAN</span>
-                  <span className="rpt-cover-meta-value">{lastScan.date}</span>
-                </div>
-                <div className="rpt-cover-meta-item">
-                  <span className="rpt-cover-meta-label">DATE D'EXPORT</span>
-                  <span className="rpt-cover-meta-value">
-                    {new Date().toLocaleDateString("fr-FR", { day: "2-digit", month: "long", year: "numeric" })}
-                  </span>
-                </div>
-              </div>
-            </div>
+        </div>
 
-            {/* Executive Summary */}
-            <div className="rpt-executive">
-              <h2 className="rpt-executive-title">Synthèse Exécutive</h2>
-              <div className="rpt-executive-grid">
-                {(() => {
-                  const verdict = getRiskVerdict(lastScan.vulnerabilities);
-                  return (
-                    <div className="rpt-risk-verdict" style={{ background: verdict.bg, borderColor: verdict.border }}>
-                      <span className="rpt-risk-verdict-label" style={{ color: verdict.color }}>NIVEAU DE RISQUE</span>
-                      <span className="rpt-risk-verdict-level" style={{ color: verdict.color }}>{verdict.level}</span>
-                      <span className="rpt-risk-verdict-count" style={{ color: verdict.color }}>
-                        {lastScan.count} vulnérabilité{lastScan.count !== 1 ? "s" : ""} identifiée{lastScan.count !== 1 ? "s" : ""}
-                      </span>
-                    </div>
-                  );
-                })()}
-                <div className="rpt-meter-wrap">
-                  {SEV_ORDER.map((s) => {
-                    const sev = SEV[s];
-                    const count = countBySev(lastScan.vulnerabilities)[s];
-                    const maxCount = Math.max(...SEV_ORDER.map((k) => countBySev(lastScan.vulnerabilities)[k]), 1);
-                    const pct = (count / maxCount) * 100;
-                    return (
-                      <div key={s} className="rpt-meter-row">
-                        <span className="rpt-meter-label" style={{ color: sev.printColor }}>{s.toUpperCase()}</span>
-                        <div className="rpt-meter-bar-bg">
-                          <div className="rpt-meter-bar-fill" style={{ width: `${count > 0 ? Math.max(pct, 5) : 0}%`, background: sev.printColor }} />
-                        </div>
-                        <span className="rpt-meter-count" style={{ color: sev.printColor }}>{count}</span>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
+        <section className="card scan-card" aria-labelledby="scan-title">
+          <div className="card-heading"><div><h2 id="scan-title">Nouvelle analyse</h2><p>Évaluez l’exposition d’une application web autorisée.</p></div></div>
+          <form onSubmit={handleScan}>
+            <div className="scan-form-row">
+              <label className="field field--url"><span>URL cible</span><input className="technical" type="url" required placeholder="https://exemple.fr" value={url} onChange={(event) => setUrl(event.target.value)} /></label>
+              <label className="field field--cookie"><span>Cookie de session <small>Optionnel</small></span><input className="technical" type="text" placeholder="SESSION=…" value={cookieHeader} onChange={(event) => setCookieHeader(event.target.value)} /></label>
+              <label className="field field--depth"><span>Profondeur</span><select value={securityLevel} onChange={(event) => setSecurityLevel(event.target.value)}><option value="light">Légère</option><option value="standard">Standard</option><option value="deep">Approfondie</option></select></label>
+              <button className="primary-button" type="submit" disabled={scanStatus === "loading"}>{scanStatus === "loading" ? "Analyse en cours…" : "Lancer l’analyse"}</button>
             </div>
+            <div className="authorization-row">
+              <label><input type="checkbox" checked={authorized} onChange={(event) => setAuthorized(event.target.checked)} /><span>Je confirme être autorisé à analyser cette cible.</span></label>
+              <p>Utilisez ce service uniquement sur des systèmes dont vous êtes propriétaire ou pour lesquels vous disposez d’une autorisation explicite.</p>
+            </div>
+            {scanMessage && <p className={`form-message form-message--${scanStatus ?? "info"}`} role="status">{scanMessage}</p>}
+          </form>
+        </section>
 
-            {/* Severity summary boxes */}
-            <div className="rpt-block">
-              <h2 className="rpt-block-title">Résumé par Criticité</h2>
-              <div className="rpt-summary">
-                {SEV_ORDER.map((s) => {
-                  const sev = SEV[s];
-                  const count = countBySev(lastScan.vulnerabilities)[s];
-                  return (
-                    <div key={s} className="rpt-sev-item" style={{ background: sev.printBg, borderColor: sev.printBorder }}>
-                      <span className="rpt-sev-label" style={{ color: sev.printColor }}>{s.toUpperCase()}</span>
-                      <span className="rpt-sev-count" style={{ color: sev.printColor }}>{count}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
+        <section className="stats-grid" aria-label="Indicateurs principaux">
+          <article className="stat-card"><span>Analyses totales</span><strong>{scans.length}</strong><p>{completedScans} analyse{completedScans === 1 ? "" : "s"} terminée{completedScans === 1 ? "" : "s"}</p></article>
+          <article className="stat-card"><span>Vulnérabilités actives</span><strong>{findings.length}</strong><p>Sur la dernière cible analysée</p></article>
+          <article className="stat-card"><span>Score de sécurité</span><strong>{lastScan ? `${securityScore}%` : "—"}</strong><p>{lastScan ? "Estimation de la surface actuelle" : "En attente d’une première analyse"}</p></article>
+          <article className="stat-card"><span>Résultats critiques</span><strong>{counts.Critique}</strong><p>{counts.Critique ? "Action prioritaire requise" : "Aucun résultat critique ouvert"}</p></article>
+        </section>
 
-            {/* Detailed findings */}
-            <div className="rpt-block">
-              <h2 className="rpt-block-title">Détail des Vulnérabilités</h2>
-              {lastScan.vulnerabilities.length === 0 ? (
-                <p className="rpt-no-vuln">Aucune vulnérabilité détectée lors de cet audit.</p>
-              ) : (
-                lastScan.vulnerabilities.map((v, i) => {
-                  const sev = getSev(v.criticite);
-                  return (
-                    <div key={v.id} className="rpt-vuln" style={{ borderLeftColor: sev.printColor }}>
-                      <div className="rpt-vuln-header">
-                        <span className="rpt-vuln-num">{i + 1}</span>
-                        <span className="rpt-badge" style={{ background: sev.printBg, color: sev.printColor, borderColor: sev.printBorder }}>{sev.label}</span>
-                        <h3 className="rpt-vuln-title">{v.type}</h3>
-                      </div>
-                      <div className="rpt-vuln-body">
-                        <div className="rpt-desc-body">
-                          <h4 className="rpt-vuln-section-title rpt-desc-title">Description</h4>
-                          <p className="rpt-vuln-text">{v.description}</p>
-                        </div>
-                        <div className="rpt-reco">
-                          <h4 className="rpt-vuln-section-title rpt-reco-title">Recommandation</h4>
-                          <p className="rpt-vuln-text">{v.remediation}</p>
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })
-              )}
-            </div>
+        <section className="overview-grid">
+          <article className="card chart-card">
+            <div className="card-heading"><div><h2>Répartition par sévérité</h2><p>Dernière analyse enregistrée</p></div></div>
+            {loading ? <p className="empty-text">Chargement de la répartition…</p> : <DonutChart counts={counts} />}
+          </article>
 
-            {/* Footer */}
-            <div className="rpt-footer">
-              <div className="rpt-footer-line">
-                <p>CONFIDENTIEL</p>
-                <span className="rpt-footer-dot" />
-                <p>Vulnerability Scanner v2.0</p>
-                <span className="rpt-footer-dot" />
-                <p>{new Date().toLocaleDateString("fr-FR", { day: "2-digit", month: "long", year: "numeric" })}</p>
-              </div>
-              <p style={{ marginTop: "6pt" }}>
-                Ce rapport est confidentiel et destiné exclusivement à l'équipe de sécurité mandatée.
-                Toute reproduction ou divulgation non autorisée est interdite.
-              </p>
+          <article className="card history-card">
+            <div className="card-heading"><div><h2>Analyses récentes</h2><p>Historique des dernières exécutions</p></div></div>
+            <div className="table-scroll">
+              <table className="history-table">
+                <thead><tr><th>Cible</th><th>Date</th><th>État</th></tr></thead>
+                <tbody>
+                  {recentScans.length ? recentScans.map((scan) => (
+                    <tr key={scan.id}><td className="technical target-cell">{scan.url}</td><td className="technical">{formatDate(scan.date_scan ?? scan.date)}</td><td><span className={`status-tag ${String(scan.statut).toLowerCase().includes("termin") ? "status-tag--success" : ""}`}>{scan.statut}</span></td></tr>
+                  )) : <tr><td colSpan="3" className="empty-cell">Aucune analyse n’a encore été exécutée.</td></tr>}
+                </tbody>
+              </table>
             </div>
+          </article>
+        </section>
+
+        <section className="card findings-card">
+          <div className="card-heading findings-heading">
+            <div><h2>Résultats de sécurité</h2><p>{lastScan ? <>Dernière analyse de <span className="technical">{lastScan.url}</span></> : "Aucune cible analysée"}</p></div>
+            <span className="result-count">{findings.length} résultat{findings.length === 1 ? "" : "s"}</span>
           </div>
-        )}
-      </div>
+          <div className="table-scroll">
+            <table className="findings-table">
+              <thead><tr><th>Sévérité</th><th>Vulnérabilité</th><th>Endpoint</th><th>Détectée le</th><th>Statut</th></tr></thead>
+              <tbody>
+                {findings.length ? findings.map((finding, index) => (
+                  <tr className="finding-row" style={{ "--row-delay": `${index * 45}ms` }} key={finding.id ?? `${finding.type}-${index}`}>
+                    <td><SeverityTag value={finding.criticite} /></td>
+                    <td><strong>{finding.type || "Vulnérabilité non classée"}</strong><span className="finding-description">{finding.description}</span></td>
+                    <td className="technical endpoint-cell">{finding.endpoint || lastScan?.url || "—"}</td>
+                    <td className="technical date-cell">{formatDate(finding.date_detection || lastScan?.date)}</td>
+                    <td><span className="status-tag">À traiter</span></td>
+                  </tr>
+                )) : <tr><td colSpan="5" className="empty-cell">Aucun résultat à afficher pour le moment.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
     </div>
+    <PdfReport scan={lastScan} findings={findings} counts={counts} />
+    </>
   );
 }
 

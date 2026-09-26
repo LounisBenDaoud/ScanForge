@@ -110,7 +110,8 @@ def start_scan():
     scan_options = {
         "profile": data.get("profile", os.getenv("SCANNER_PROFILE", "generic")),
         "cookie_header": data.get("cookieHeader", ""),
-        "security_level": data.get("securityLevel", ""),
+        "depth": data.get("securityLevel", "standard"),
+        "dvwa_security_level": data.get("dvwaSecurityLevel", ""),
         "tests": data.get("tests", {}),
     }
 

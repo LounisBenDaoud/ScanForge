@@ -1,12 +1,17 @@
+import json
+import hashlib
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 import uuid
 from difflib import SequenceMatcher
-from html import unescape as html_unescape
 from html.parser import HTMLParser
 from urllib.parse import (
     parse_qsl,
+    quote,
     urldefrag,
     urlencode,
     urljoin,
@@ -24,6 +29,7 @@ try:
         build_session,
         connect_db,
         finish_scan,
+        get_depth_config,
         get_scope_root,
         normalize_target_url,
         same_origin,
@@ -35,6 +41,7 @@ except ImportError:
         build_session,
         connect_db,
         finish_scan,
+        get_depth_config,
         get_scope_root,
         normalize_target_url,
         same_origin,
@@ -52,6 +59,16 @@ TIME_SLEEP_SECONDS = 5
 TIME_THRESHOLD = 4.0
 # Max pages to use for guess-based candidate generation (to avoid explosion)
 MAX_GUESS_PAGES = 5
+
+# Browser-side routes are invisible to ``requests`` because URL fragments are
+# never sent to the server.  These probes cover common SPA search/tracking
+# routes and are validated in a real Chromium DOM before being reported.
+DOM_XSS_ROUTES = (
+    ("#/search", "q"),
+    ("#/track-result", "id"),
+)
+DOM_XSS_ATTRIBUTE = "data-scanforge-xss"
+DOM_BROWSER_TIMEOUT = 20
 # Most common params to try when guessing (subset of XSS/SQLI_PARAM_NAMES)
 TOP_GUESS_PARAMS_XSS = {"q", "query", "search", "s", "name", "message", "email", "input"}
 TOP_GUESS_PARAMS_SQLI = {"id", "q", "query", "search", "user", "product", "category", "page"}
@@ -279,6 +296,12 @@ XSS_PAYLOADS = [
     # Case variation bypass
     f'<ScRiPt>alert("{_XSS_MARKER}")</ScRiPt>',
     f'<IMG SRC=x ONERROR=alert("{_XSS_MARKER}")>',
+    # Break out of common raw-text HTML contexts
+    f'</textarea><svg/onload=alert("{_XSS_MARKER}")>',
+    f'</title><svg/onload=alert("{_XSS_MARKER}")>',
+    f'</script><svg/onload=alert("{_XSS_MARKER}")>',
+    # Iframe/srcdoc context
+    f'<iframe srcdoc="<svg onload=alert(\'{_XSS_MARKER}\')>"></iframe>',
     # JavaScript URI (for href/src attributes)
     f'javascript:alert("{_XSS_MARKER}")',
     # Polyglot payload — works in multiple contexts
@@ -306,13 +329,9 @@ SQL_ERRORS = [
     # Generic SQL
     "sqlstate",
     "pdoexception",
-    "invalid query",
-    "database error",
     "sql error",
     'near "',
     "unclosed quotation",
-    "syntax error",
-    "unterminated string",
     "unterminated quoted string",
     "quoted string not properly terminated",
     # PostgreSQL
@@ -350,27 +369,28 @@ SQL_ERRORS = [
     "wpdb::prepare",
     "pdo::query",
     "doctrine\\dbal",
-    "hibernate",
     "sequelize",
     "knex:",
-    "prisma",
-    "active record",
     "activerecord::statementerror",
     # Python frameworks
     "operationalerror",
-    "programmingError",
+    "programmingerror",
     "django.db.utils",
     "sqlalchemy.exc",
     # PHP frameworks
-    "laravel",
     "illuminate\\database",
-    "wp_error",
     # General patterns
     "unexpected end of sql",
     "warning: pg_",
     "warning: sqlite",
     "dynamic sql error",
     "unrecognized token",
+    "sqlcode=",
+    "sqlstate=",
+    "db2 sql error",
+    "sybase message",
+    "syntax error in query expression",
+    "unterminated quoted identifier",
 ]
 
 NO_RESULT_TOKENS = [
@@ -428,6 +448,7 @@ class FormAndLinkParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.links = []
+        self.scripts = []
         self.forms = []
         self._form = None
         self._textarea = None
@@ -436,6 +457,10 @@ class FormAndLinkParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         tag = tag.lower()
+
+        if tag == "script" and attrs.get("src"):
+            self.scripts.append(attrs["src"])
+            return
 
         if tag == "a" and attrs.get("href"):
             self.links.append(attrs["href"])
@@ -576,6 +601,8 @@ def _discover_pages_and_forms(session, root, timeout, max_pages):
 
     pages = []
     forms = []
+    scripts = []
+    content_signatures = set()
 
     while queue and len(pages) < max_pages:
         page_url = queue.pop(0)
@@ -591,6 +618,18 @@ def _discover_pages_and_forms(session, root, timeout, max_pages):
         if response.status_code >= 400:
             continue
 
+        # SPA routers frequently return the exact same entry document for
+        # every unknown path. Keep one copy so guessed routes do not multiply
+        # identical injection candidates.
+        content_signature = hashlib.sha256(response.content).digest()
+        if content_signature in content_signatures:
+            continue
+        content_signatures.add(content_signature)
+
+        content_type = response.headers.get("Content-Type", "").lower()
+        if "html" not in content_type and "xhtml" not in content_type:
+            continue
+
         # Log auth redirect as warning but still try to parse the landing page
         # (the login page itself may have forms we can discover).
         if _is_auth_redirect(response, page_url):
@@ -601,6 +640,10 @@ def _discover_pages_and_forms(session, root, timeout, max_pages):
             )
             # Still parse the login page for forms (but don't add to injectable pages)
             parser = _parse_page(response)
+            for src in parser.scripts:
+                script_url = _absolute_url(response.url, src)
+                if same_origin(script_url, root) and script_url not in scripts:
+                    scripts.append(script_url)
             for href in parser.links:
                 absolute = _absolute_url(response.url, href)
                 if (
@@ -613,6 +656,11 @@ def _discover_pages_and_forms(session, root, timeout, max_pages):
 
         pages.append(response.url)
         parser = _parse_page(response)
+
+        for src in parser.scripts:
+            script_url = _absolute_url(response.url, src)
+            if same_origin(script_url, root) and script_url not in scripts:
+                scripts.append(script_url)
 
         for form in parser.forms:
             action_url = _absolute_url(response.url, form.get("action", ""))
@@ -636,7 +684,7 @@ def _discover_pages_and_forms(session, root, timeout, max_pages):
             f"Provide a valid session cookie for better coverage."
         )
 
-    return pages, forms
+    return pages, forms, scripts
 
 
 def _field_default(field, purpose):
@@ -653,7 +701,15 @@ def _field_default(field, purpose):
 
 def _candidate_key(candidate):
     data_keys = tuple(sorted(candidate.get("base_data", {}).keys()))
-    return (candidate["method"], candidate["url"], candidate["param"], data_keys)
+    param_keys = tuple(sorted(candidate.get("base_params", {}).keys()))
+    return (
+        candidate["method"],
+        candidate["url"],
+        candidate["param"],
+        candidate.get("param_location", "auto"),
+        data_keys,
+        param_keys,
+    )
 
 
 def _dedupe(candidates):
@@ -722,7 +778,13 @@ def _form_candidates(forms, purpose):
             if not name or input_type in SKIP_INPUT_TYPES:
                 continue
             base_data[name] = _field_default(field, purpose)
-            if input_type in INJECTABLE_INPUT_TYPES:
+            # Preserve hidden CSRF/state fields in the request, but do not
+            # inject into them unless their name actually looks user-controlled.
+            hidden_is_relevant = input_type != "hidden" or (
+                name.lower() in XSS_PARAM_NAMES
+                or name.lower() in SQLI_PARAM_NAMES
+            )
+            if input_type in INJECTABLE_INPUT_TYPES and hidden_is_relevant:
                 injectable.append(name)
 
         for name in injectable:
@@ -736,6 +798,29 @@ def _form_candidates(forms, purpose):
                 }
             )
     return candidates
+
+
+def _is_missing_endpoint_response(response):
+    """Recognize framework/router errors that do not prove endpoint existence."""
+    if response.status_code in {404, 405, 501}:
+        return True
+    content_type = response.headers.get("Content-Type", "").lower()
+    if "html" in content_type and _looks_like_spa_html(response.text):
+        return True
+    lowered = response.text[:8000].lower()
+    routing_errors = (
+        "unexpected path:",
+        "cannot get /",
+        "cannot post /",
+        "cannot put /",
+        "cannot patch /",
+        "no route matches",
+        "route not found",
+        "endpoint not found",
+    )
+    return response.status_code >= 400 and any(
+        marker in lowered for marker in routing_errors
+    )
 
 
 def _api_candidates(root, session, timeout, purpose="both"):
@@ -761,8 +846,9 @@ def _api_candidates(root, session, timeout, purpose="both"):
                 resp = session.post(
                     url, json=test_data, timeout=timeout, allow_redirects=True
                 )
-            # Skip endpoints that return 404 or similar
-            if resp.status_code >= 404:
+            # Reject non-existent SPA fallback pages. A 400/401/403/422/500
+            # API response can still prove that an endpoint exists.
+            if _is_missing_endpoint_response(resp):
                 continue
         except requests.exceptions.RequestException:
             continue
@@ -793,8 +879,7 @@ def _rest_login_sqli_candidates(root, session, timeout):
             resp = session.post(
                 url, json=test_data, timeout=timeout, allow_redirects=True
             )
-            # Skip endpoints that return 404
-            if resp.status_code == 404:
+            if _is_missing_endpoint_response(resp):
                 continue
             # 401/200/500 all indicate the endpoint exists
         except requests.exceptions.RequestException:
@@ -813,15 +898,240 @@ def _rest_login_sqli_candidates(root, session, timeout):
     return candidates
 
 
+def _candidate_purposes(param):
+    """Classify an input name without assuming a particular framework."""
+    lowered = str(param).lower()
+    purposes = set()
+    if lowered in XSS_PARAM_NAMES or any(
+        hint in lowered
+        for hint in ("search", "query", "comment", "message", "text", "title", "name")
+    ):
+        purposes.add("xss")
+    if lowered in SQLI_PARAM_NAMES or any(
+        hint in lowered
+        for hint in ("id", "user", "email", "filter", "sort", "category", "product")
+    ):
+        purposes.add("sqli")
+    return purposes or {"xss", "sqli"}
+
+
+def _schema_properties(spec, schema):
+    """Resolve one local OpenAPI schema and return its properties."""
+    if not isinstance(schema, dict):
+        return {}
+    reference = schema.get("$ref", "")
+    if reference.startswith("#/"):
+        current = spec
+        try:
+            for part in reference[2:].split("/"):
+                current = current[part.replace("~1", "/").replace("~0", "~")]
+            schema = current
+        except (KeyError, TypeError):
+            return {}
+    return schema.get("properties", {}) if isinstance(schema, dict) else {}
+
+
+def _openapi_candidates(root, session, timeout):
+    """Build candidates from exposed OpenAPI/Swagger metadata."""
+    docs = (
+        "openapi.json",
+        "swagger.json",
+        "api-docs",
+        "api-docs/swagger.json",
+        "api-docs/swagger-ui-init.js",
+        "v3/api-docs",
+    )
+    spec = None
+    for path in docs:
+        try:
+            response = session.get(_join_url(root, path), timeout=timeout, allow_redirects=True)
+            if response.status_code != 200:
+                continue
+            try:
+                candidate_spec = response.json()
+            except ValueError:
+                # swagger-ui-express commonly embeds the full OpenAPI object
+                # as `"swaggerDoc": {...}` in swagger-ui-init.js.
+                match = re.search(r'["\']swaggerDoc["\']\s*:\s*', response.text)
+                if not match:
+                    continue
+                candidate_spec, _ = json.JSONDecoder().raw_decode(
+                    response.text, match.end()
+                )
+            if isinstance(candidate_spec, dict) and isinstance(candidate_spec.get("paths"), dict):
+                spec = candidate_spec
+                break
+        except (requests.exceptions.RequestException, ValueError):
+            continue
+    if spec is None:
+        return []
+
+    api_root = root
+    base_path = spec.get("basePath")
+    if isinstance(base_path, str) and base_path.strip("/"):
+        api_root = _join_url(root, base_path)
+    servers = spec.get("servers", [])
+    if isinstance(servers, list) and servers and isinstance(servers[0], dict):
+        server_url = servers[0].get("url", "")
+        if isinstance(server_url, str) and "{" not in server_url:
+            absolute_server = urljoin(root.rstrip("/") + "/", server_url)
+            if same_origin(absolute_server, root):
+                api_root = absolute_server.rstrip("/")
+
+    candidates = []
+    for path, path_item in list(spec["paths"].items())[:100]:
+        if not isinstance(path_item, dict):
+            continue
+        shared_parameters = path_item.get("parameters", [])
+        if not isinstance(shared_parameters, list):
+            shared_parameters = []
+        for method in ("get", "post", "put", "patch"):
+            operation = path_item.get(method)
+            if not isinstance(operation, dict):
+                continue
+            operation_parameters = operation.get("parameters", [])
+            if not isinstance(operation_parameters, list):
+                operation_parameters = []
+            parameters = list(shared_parameters) + operation_parameters
+            base_query = {}
+            base_body = {}
+            injectable = []
+            resolved_path = path
+
+            for parameter in parameters:
+                if not isinstance(parameter, dict) or not parameter.get("name"):
+                    continue
+                name = parameter["name"]
+                location = parameter.get("in", "query")
+                schema = parameter.get("schema", {})
+                if not isinstance(schema, dict):
+                    schema = {}
+                default = schema.get(
+                    "example", schema.get("default", parameter.get("example", "test"))
+                )
+                if location == "query":
+                    base_query[name] = str(default)
+                    injectable.append((name, False, "query"))
+                elif location == "path":
+                    resolved_path = resolved_path.replace(
+                        "{" + name + "}", str(default if default != "test" else "1")
+                    )
+                elif location == "body":
+                    for prop, details in _schema_properties(spec, schema).items():
+                        details = details if isinstance(details, dict) else {}
+                        base_body[prop] = str(
+                            details.get("example", details.get("default", "test"))
+                        )
+                        injectable.append((prop, True, "body"))
+                elif location == "formData":
+                    base_body[name] = str(default)
+                    injectable.append((name, False, "body"))
+
+            request_body = operation.get("requestBody", {})
+            if not isinstance(request_body, dict):
+                request_body = {}
+            content = request_body.get("content", {})
+            if not isinstance(content, dict):
+                content = {}
+            json_media = content.get("application/json", {})
+            if not isinstance(json_media, dict):
+                json_media = {}
+            json_schema = json_media.get("schema", {})
+            uses_json_body = bool(json_schema)
+            for prop, details in _schema_properties(spec, json_schema).items():
+                details = details if isinstance(details, dict) else {}
+                base_body[prop] = str(
+                    details.get("example", details.get("default", "test"))
+                )
+                injectable.append((prop, True, "body"))
+
+            for name, json_mode, location in injectable:
+                candidates.append(
+                    {
+                        "method": method,
+                        "url": _join_url(api_root, resolved_path),
+                        "param": name,
+                        "base_data": dict(base_query if method == "get" else base_body),
+                        "base_params": dict(base_query if method != "get" else {}),
+                        "param_location": location,
+                        "source": "openapi",
+                        "json_mode": bool(
+                            json_mode
+                            or (location == "query" and base_body and uses_json_body)
+                        ),
+                        "purposes": _candidate_purposes(name),
+                    }
+                )
+    return candidates
+
+
+def _javascript_candidates(root, pages, scripts, session, timeout, max_scripts):
+    """Extract real query-bearing endpoints from crawled HTML and JS bundles."""
+    discovered_urls = set(pages)
+    path_pattern = re.compile(
+        r"[\"'`](\/[^\"'`\s<>]{1,220}\?[A-Za-z_][^\"'`\s<>]{0,180})[\"'`]"
+    )
+    total_bytes = 0
+    for script_url in scripts[:max_scripts]:
+        try:
+            response = session.get(script_url, timeout=timeout, allow_redirects=True)
+        except requests.exceptions.RequestException:
+            continue
+        if response.status_code >= 400:
+            continue
+        total_bytes += len(response.content)
+        if total_bytes > 15_000_000:
+            break
+        for match in path_pattern.finditer(response.text.replace("\\/", "/")):
+            absolute = urljoin(root.rstrip("/") + "/", match.group(1))
+            if same_origin(absolute, root):
+                discovered_urls.add(absolute)
+
+    candidates = []
+    for discovered_url in discovered_urls:
+        parsed = urlparse(discovered_url)
+        params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if not params:
+            continue
+        base_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+        for name, value in params.items():
+            candidates.append(
+                {
+                    "method": "get",
+                    "url": base_url,
+                    "param": name,
+                    "base_data": {**params, name: value or "test"},
+                    "source": "javascript",
+                    "purposes": _candidate_purposes(name),
+                }
+            )
+    return candidates
+
+
+def _for_purpose(candidates, purpose):
+    return [
+        candidate
+        for candidate in candidates
+        if purpose in candidate.get("purposes", {"xss", "sqli"})
+    ]
+
+
 def _build_candidates(
-    url_cible, session, scan_target, crawl_root, timeout, max_pages, max_candidates
+    url_cible, session, scan_target, crawl_root, timeout, max_pages, max_candidates,
+    max_scripts=6,
 ):
-    pages, forms = _discover_pages_and_forms(session, crawl_root, timeout, max_pages)
+    pages, forms, scripts = _discover_pages_and_forms(
+        session, crawl_root, timeout, max_pages
+    )
     for page in (scan_target, crawl_root):
         if page not in pages:
             pages.insert(0, page)
 
     direct = _direct_query_candidates(url_cible)
+    discovered = _javascript_candidates(
+        crawl_root, pages, scripts, session, timeout, max_scripts
+    )
+    documented = _openapi_candidates(crawl_root, session, timeout)
 
     # Detect if this is a SPA (no forms found from crawling)
     is_spa = len(forms) == 0
@@ -838,11 +1148,28 @@ def _build_candidates(
     if login_sqli:
         print(f"  [i] Endpoints login REST découverts: {len(login_sqli)}")
 
+    if discovered or documented:
+        print(
+            f"  [i] Candidats génériques: {len(discovered)} via HTML/JS, "
+            f"{len(documented)} via OpenAPI"
+        )
+
     xss_candidates = (
-        direct + _form_candidates(forms, "xss") + api_xss + _page_guess_candidates(pages, "xss")
+        direct
+        + _form_candidates(forms, "xss")
+        + _for_purpose(documented, "xss")
+        + _for_purpose(discovered, "xss")
+        + api_xss
+        + _page_guess_candidates(pages, "xss")
     )
     sqli_candidates = (
-        direct + _form_candidates(forms, "sqli") + api_sqli + login_sqli + _page_guess_candidates(pages, "sqli")
+        direct
+        + _form_candidates(forms, "sqli")
+        + _for_purpose(documented, "sqli")
+        + _for_purpose(discovered, "sqli")
+        + api_sqli
+        + login_sqli
+        + _page_guess_candidates(pages, "sqli")
     )
 
     return _dedupe(xss_candidates)[:max_candidates], _dedupe(sqli_candidates)[
@@ -854,45 +1181,67 @@ def _build_candidates(
 
 def _send_candidate(session, candidate, value, timeout):
     data = dict(candidate.get("base_data", {}))
-    data[candidate["param"]] = value
+    query = dict(candidate.get("base_params", {}))
     method = candidate.get("method", "get").lower()
     json_mode = candidate.get("json_mode", False)
-
-    if method == "post":
-        if json_mode:
-            return session.post(
-                candidate["url"], json=data, timeout=timeout, allow_redirects=True
-            )
-        return session.post(
-            candidate["url"], data=data, timeout=timeout, allow_redirects=True
-        )
-    return session.get(
-        _with_params(candidate["url"], data), timeout=timeout, allow_redirects=True
+    location = candidate.get(
+        "param_location", "query" if method == "get" else "body"
     )
+    if location == "query":
+        query[candidate["param"]] = value
+    else:
+        data[candidate["param"]] = value
+
+    if method in {"post", "put", "patch"}:
+        if json_mode:
+            return session.request(
+                method, candidate["url"], params=query, json=data,
+                timeout=timeout, allow_redirects=True
+            )
+        return session.request(
+            method, candidate["url"], params=query, data=data,
+            timeout=timeout, allow_redirects=True
+        )
+    query.update(data)
+    if location == "query":
+        query[candidate["param"]] = value
+    return session.get(candidate["url"], params=query, timeout=timeout, allow_redirects=True)
 
 
 def _timed_send(session, candidate, value, timeout):
     """Send a candidate and return (response, elapsed_seconds)."""
     data = dict(candidate.get("base_data", {}))
-    data[candidate["param"]] = value
+    query = dict(candidate.get("base_params", {}))
     method = candidate.get("method", "get").lower()
     json_mode = candidate.get("json_mode", False)
+    location = candidate.get(
+        "param_location", "query" if method == "get" else "body"
+    )
+    if location == "query":
+        query[candidate["param"]] = value
+    else:
+        data[candidate["param"]] = value
 
     start = time.monotonic()
-    if method == "post":
+    if method in {"post", "put", "patch"}:
         if json_mode:
-            resp = session.post(
-                candidate["url"], json=data, timeout=max(timeout, TIME_SLEEP_SECONDS + 5),
+            resp = session.request(
+                method, candidate["url"], params=query, json=data,
+                timeout=max(timeout, TIME_SLEEP_SECONDS + 5),
                 allow_redirects=True,
             )
         else:
-            resp = session.post(
-                candidate["url"], data=data, timeout=max(timeout, TIME_SLEEP_SECONDS + 5),
+            resp = session.request(
+                method, candidate["url"], params=query, data=data,
+                timeout=max(timeout, TIME_SLEEP_SECONDS + 5),
                 allow_redirects=True,
             )
     else:
+        query.update(data)
+        if location == "query":
+            query[candidate["param"]] = value
         resp = session.get(
-            _with_params(candidate["url"], data),
+            candidate["url"], params=query,
             timeout=max(timeout, TIME_SLEEP_SECONDS + 5),
             allow_redirects=True,
         )
@@ -902,7 +1251,7 @@ def _timed_send(session, candidate, value, timeout):
 
 # ─── XSS Detection ───────────────────────────────────────────────────────────
 
-def _contains_raw_xss(response_text, payload):
+def _contains_raw_xss(response_text, payload, content_type=""):
     """Check if a XSS payload is reflected without proper encoding.
 
     Detection strategy:
@@ -911,11 +1260,22 @@ def _contains_raw_xss(response_text, payload):
        indicate the payload was reflected without HTML-entity encoding.
        Tokens must appear NEAR the marker (within ~500 chars) to avoid
        false positives from the page's own scripts.
-    3. HTML-decode the response and re-check — catches cases where the
-       app double-encodes or the browser would decode entities.
-    4. Check JSON responses — APIs may reflect payloads inside JSON strings,
-       but only flag if dangerous HTML tokens are also present.
+    HTML-entity encoded output is intentionally not decoded here: entities
+    rendered as text are not executable markup. Browser-side consumption is
+    validated separately by the dynamic DOM probe.
     """
+    # A value echoed by a JSON API is data, not executable HTML by itself.
+    # Browser-side consumption is covered separately by the DOM-XSS probe.
+    if "json" in content_type.lower():
+        return False
+    stripped = response_text.lstrip()
+    if stripped.startswith(("{", "[")):
+        try:
+            json.loads(response_text)
+            return False
+        except (json.JSONDecodeError, ValueError):
+            pass
+
     # 1. Exact match
     if payload in response_text:
         return True
@@ -930,8 +1290,7 @@ def _contains_raw_xss(response_text, payload):
 
     dangerous_tokens = (
         "<script", "</script>", "<svg", "<img", "<body", "<details", "<marquee",
-        "onerror=", "onload=", "onfocus=", "onmouseover=", "ontoggle=", "onstart=",
-        "javascript:", "alert(",
+        "<iframe", "javascript:",
     )
 
     # Find all positions where the marker appears and check if any dangerous
@@ -948,40 +1307,6 @@ def _contains_raw_xss(response_text, payload):
             return True
         marker_pos = idx + 1
 
-    # 3. HTML-decode the response and re-check with proximity
-    decoded = html_unescape(response_text)
-    decoded_lower = decoded.lower()
-    if marker_lower in decoded_lower:
-        # Check exact decoded match first
-        if payload in decoded:
-            return True
-        # Proximity check on decoded content
-        marker_pos = 0
-        while True:
-            idx = decoded_lower.find(marker_lower, marker_pos)
-            if idx == -1:
-                break
-            window_start = max(0, idx - 500)
-            window_end = min(len(decoded_lower), idx + len(marker_lower) + 500)
-            window = decoded_lower[window_start:window_end]
-            if any(token in window for token in dangerous_tokens):
-                return True
-            marker_pos = idx + 1
-
-    # 4. JSON response handling — check if payload is reflected inside JSON strings
-    # Only flag if dangerous HTML tokens are also present (not just the marker,
-    # since APIs legitimately echo search terms like {"query": "XSS_SCAN"}).
-    try:
-        import json
-        if response_text.strip().startswith('{') or response_text.strip().startswith('['):
-            json_str = json.dumps(json.loads(response_text))
-            if _XSS_MARKER in json_str:
-                json_lower = json_str.lower()
-                if any(token in json_lower for token in dangerous_tokens):
-                    return True
-    except (json.JSONDecodeError, ValueError):
-        pass
-
     return False
 
 
@@ -997,6 +1322,363 @@ def _canary_reflects(session, candidate, timeout):
         return canary in response.text, response.text
     except requests.exceptions.RequestException:
         return False, ""
+
+
+def _find_chromium_browser(options=None):
+    """Return an installed Chromium-family browser for DOM execution checks."""
+    options = options or {}
+    configured = options.get("browser_path") or os.getenv("SCANNER_BROWSER_PATH")
+    candidates = [configured] if configured else []
+
+    for command in ("chrome", "google-chrome", "chromium", "chromium-browser", "msedge"):
+        resolved = shutil.which(command)
+        if resolved:
+            candidates.append(resolved)
+
+    program_files = os.environ.get("ProgramFiles", "")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", "")
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    candidates.extend(
+        [
+            os.path.join(program_files, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(program_files_x86, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(local_app_data, "Google", "Chrome", "Application", "chrome.exe"),
+            os.path.join(program_files, "Microsoft", "Edge", "Application", "msedge.exe"),
+            os.path.join(program_files_x86, "Microsoft", "Edge", "Application", "msedge.exe"),
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ]
+    )
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        candidate = os.path.abspath(os.path.expandvars(os.path.expanduser(candidate)))
+        if candidate not in seen and os.path.isfile(candidate):
+            return candidate
+        seen.add(candidate)
+    return None
+
+
+def _looks_like_spa_html(html_text):
+    """Recognize common SPA entry documents without tying detection to Juice Shop."""
+    lowered = html_text.lower()
+    indicators = (
+        "<app-root",
+        "<router-outlet",
+        'id="root"',
+        "id='root'",
+        'id="app"',
+        "id='app'",
+        "__next_data__",
+        "ng-version=",
+    )
+    has_app_mount = any(indicator in lowered for indicator in indicators)
+    has_script_bundle = bool(
+        re.search(r"<script[^>]+src=[\"'][^\"']*(?:main|runtime|bundle|app)[^\"']*\.js", lowered)
+    )
+    return has_app_mount or has_script_bundle
+
+
+def _dom_probe_routes(url_cible):
+    """Return fragment routes to test, including a route supplied by the user."""
+    routes = list(DOM_XSS_ROUTES)
+    fragment = urlsplit(url_cible).fragment
+    if fragment:
+        fragment_path, _, fragment_query = fragment.partition("?")
+        params = parse_qsl(fragment_query, keep_blank_values=True)
+        for param, _ in params:
+            if param.lower() in XSS_PARAM_NAMES:
+                normalized_route = f"#{fragment_path if fragment_path.startswith('/') else '/' + fragment_path}"
+                routes.insert(0, (normalized_route, param))
+
+    unique = []
+    seen = set()
+    for route in routes:
+        if route not in seen:
+            seen.add(route)
+            unique.append(route)
+    return unique
+
+
+def _build_dom_probe_url(root, route, param, execution_marker):
+    """Build a harmless browser payload with a separate execution side effect."""
+    input_marker = f"INPUT_{execution_marker}"
+    payload = (
+        f'<img src="/scanforge-missing-{input_marker}" data-scanforge-probe="{input_marker}" '
+        f'onerror="document.documentElement.setAttribute(\'{DOM_XSS_ATTRIBUTE}\',\'{execution_marker}\')">'
+    )
+    query = urlencode({param: payload}, quote_via=quote)
+    return f"{root.rstrip('/')}/{route}?{query}"
+
+
+def _dom_execution_confirmed(rendered_dom, execution_marker):
+    """Require the marker on the root HTML element, not merely in payload text."""
+    pattern = (
+        rf"<html\b[^>]*\b{re.escape(DOM_XSS_ATTRIBUTE)}\s*=\s*"
+        rf"([\"']){re.escape(execution_marker)}\1"
+    )
+    return re.search(pattern, rendered_dom, flags=re.IGNORECASE | re.DOTALL) is not None
+
+
+def _run_browser_dump(browser, url, timeout, virtual_time_ms=None):
+    """Return (state, DOM) where state is completed, timed_out, or error."""
+    # Chrome must be able to lock its profile. Keeping the temporary profile
+    # inside the writable project tree also works in restricted environments.
+    profile_dir = tempfile.mkdtemp(
+        prefix="scanforge-browser-", dir=os.path.dirname(__file__)
+    )
+    process = None
+    try:
+        command = [
+            browser,
+            "--headless=new",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-breakpad",
+            "--disable-crash-reporter",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--ignore-certificate-errors",
+            f"--user-data-dir={profile_dir}",
+            f"--virtual-time-budget={virtual_time_ms or max(5000, timeout * 1000)}",
+            "--dump-dom",
+            url,
+        ]
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            stdout, _ = process.communicate(timeout=timeout)
+            if process.returncode != 0:
+                return "error", ""
+            return "completed", stdout
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            return "timed_out", ""
+    except OSError:
+        return "error", ""
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+        shutil.rmtree(profile_dir, ignore_errors=True)
+
+
+def _browser_alert_executes(browser, control_url, probe_url, timeout):
+    """Confirm execution when a JavaScript dialog blocks an otherwise healthy dump."""
+    control_state, _ = _run_browser_dump(
+        browser, control_url, max(DOM_BROWSER_TIMEOUT, timeout + 8)
+    )
+    if control_state != "completed":
+        return False
+    probe_state, _ = _run_browser_dump(
+        browser,
+        probe_url,
+        max(7, min(12, timeout + 2)),
+        virtual_time_ms=max(5000, timeout * 1000),
+    )
+    return probe_state == "timed_out"
+
+
+def _run_dom_xss_probe(browser, root, route, param, timeout):
+    """Execute one fragment payload in headless Chromium and inspect the live DOM."""
+    execution_marker = f"EXEC_{uuid.uuid4().hex}"
+    probe_url = _build_dom_probe_url(root, route, param, execution_marker)
+    browser_timeout = max(DOM_BROWSER_TIMEOUT, timeout + 8)
+    state, rendered_dom = _run_browser_dump(browser, probe_url, browser_timeout)
+
+    if state == "completed" and _dom_execution_confirmed(rendered_dom, execution_marker):
+        return {
+            "route": route,
+            "param": param,
+            "url": probe_url,
+            "browser": os.path.basename(browser),
+            "confirmation": "marqueur DOM",
+        }
+
+    control_url = (
+        f"{root.rstrip('/')}/{route}?"
+        + urlencode({param: "SCANFORGE_CONTROL"}, quote_via=quote)
+    )
+    alert_payload = '<iframe src="javascript:alert(\'SCANFORGE_XSS\')">'
+    alert_url = (
+        f"{root.rstrip('/')}/{route}?"
+        + urlencode({param: alert_payload}, quote_via=quote)
+    )
+    if _browser_alert_executes(browser, control_url, alert_url, timeout):
+        return {
+            "route": route,
+            "param": param,
+            "url": alert_url,
+            "browser": os.path.basename(browser),
+            "confirmation": "dialogue JavaScript exécuté",
+        }
+    return None
+
+
+def _run_reflected_xss_probe(browser, candidate, timeout):
+    """Confirm a reflected GET candidate by observing a browser side effect."""
+    if not browser or candidate.get("method", "get").lower() != "get":
+        return False
+    execution_marker = f"EXEC_{uuid.uuid4().hex}"
+    input_marker = f"INPUT_{execution_marker}"
+    payload = (
+        f'<img src="/scanforge-missing-{input_marker}" '
+        f'onerror="document.documentElement.setAttribute(\'{DOM_XSS_ATTRIBUTE}\',\'{execution_marker}\')">'
+    )
+    data = dict(candidate.get("base_data", {}))
+    data[candidate["param"]] = payload
+    probe_url = _with_params(candidate["url"], data)
+    browser_timeout = max(DOM_BROWSER_TIMEOUT, timeout + 8)
+    state, rendered_dom = _run_browser_dump(browser, probe_url, browser_timeout)
+    if state == "completed" and _dom_execution_confirmed(rendered_dom, execution_marker):
+        return True
+
+    control_data = dict(candidate.get("base_data", {}))
+    control_data[candidate["param"]] = "SCANFORGE_CONTROL"
+    control_url = _with_params(candidate["url"], control_data)
+    alert_data = dict(candidate.get("base_data", {}))
+    alert_data[candidate["param"]] = (
+        '<iframe src="javascript:alert(\'SCANFORGE_XSS\')">'
+    )
+    alert_url = _with_params(candidate["url"], alert_data)
+    return _browser_alert_executes(browser, control_url, alert_url, timeout)
+
+
+def _static_dom_xss_evidence(session, entry_response, root, timeout):
+    """Find a browser source/sink pair in same-origin JavaScript bundles.
+
+    This is deliberately a fallback: it reports a potential DOM XSS only when
+    dynamic browser confirmation is unavailable or unsuccessful.
+    """
+    parser = _parse_page(entry_response)
+    sources = (
+        "queryparammap",
+        "queryparams",
+        "activatedroute",
+        "location.hash",
+        "window.location",
+        "urlsearchparams",
+    )
+    sinks = (
+        "bypasssecuritytrusthtml",
+        "dangerouslysetinnerhtml",
+        ".innerhtml",
+        "[innerhtml]",
+        "insertadjacenthtml",
+        "document.write",
+    )
+    route_hints = ("#/search", 'path:"search"', "path:'search'", "/search")
+
+    total_bytes = 0
+    for script_src in parser.scripts[:12]:
+        script_url = urljoin(entry_response.url, script_src)
+        if not same_origin(script_url, root):
+            continue
+        try:
+            response = session.get(script_url, timeout=timeout, allow_redirects=True)
+        except requests.exceptions.RequestException:
+            continue
+        if response.status_code >= 400:
+            continue
+        total_bytes += len(response.content)
+        if total_bytes > 12_000_000:
+            break
+        lowered = response.text.lower()
+        source = next((token for token in sources if token in lowered), None)
+        sink = next((token for token in sinks if token in lowered), None)
+        route_hint = next((token for token in route_hints if token in lowered), None)
+        if source and sink and route_hint:
+            return {
+                "script": urlparse(script_url).path,
+                "source": source,
+                "sink": sink,
+                "route": route_hint,
+            }
+    return None
+
+
+def _discover_dom_routes(session, entry_response, root, timeout, max_scripts=8):
+    """Discover fragment routes and parameter names from SPA markup/bundles."""
+    parser = _parse_page(entry_response)
+    sources = [entry_response.text]
+    total_bytes = 0
+    for script_src in parser.scripts[:max_scripts]:
+        script_url = urljoin(entry_response.url, script_src)
+        if not same_origin(script_url, root):
+            continue
+        try:
+            response = session.get(script_url, timeout=timeout, allow_redirects=True)
+        except requests.exceptions.RequestException:
+            continue
+        if response.status_code >= 400:
+            continue
+        total_bytes += len(response.content)
+        if total_bytes > 15_000_000:
+            break
+        sources.append(response.text.replace("\\/", "/"))
+
+    routes = []
+    for source in sources:
+        for route, param in re.findall(
+            r"#(/[A-Za-z0-9_./:-]{1,120})\?([A-Za-z_][A-Za-z0-9_-]*)=",
+            source,
+        ):
+            if param.lower() in XSS_PARAM_NAMES:
+                routes.append((f"#{route}", param))
+        for route in re.findall(
+            r"\bpath\s*:\s*[\"']([A-Za-z0-9_./:-]{1,120})[\"']",
+            source,
+        ):
+            lowered = route.lower()
+            if "search" in lowered or "find" in lowered:
+                routes.append((f"#/{route.lstrip('/')}", "q"))
+            elif "track" in lowered or "result" in lowered:
+                routes.append((f"#/{route.lstrip('/')}", "id"))
+    return list(dict.fromkeys(routes))
+
+
+def _detect_dom_xss(session, url_cible, root, timeout, options=None):
+    """Detect browser-side XSS that an HTTP response scanner cannot observe."""
+    try:
+        entry_response = session.get(root, timeout=timeout, allow_redirects=True)
+    except requests.exceptions.RequestException:
+        return []
+    if entry_response.status_code >= 400 or not _looks_like_spa_html(entry_response.text):
+        return []
+
+    findings = []
+    browser = _find_chromium_browser(options)
+    if browser:
+        max_routes = get_depth_config(options)["max_dom_routes"]
+        discovered_routes = _discover_dom_routes(
+            session, entry_response, root, timeout,
+            get_depth_config(options)["fuzzer_max_scripts"],
+        )
+        routes = list(dict.fromkeys(discovered_routes + _dom_probe_routes(url_cible)))
+        for route, param in routes[:max_routes]:
+            result = _run_dom_xss_probe(browser, root, route, param, timeout)
+            if result:
+                findings.append({"confirmed": True, **result})
+
+    if findings:
+        return findings
+
+    evidence = _static_dom_xss_evidence(session, entry_response, root, timeout)
+    if evidence:
+        return [{"confirmed": False, **evidence}]
+    return []
 
 
 # ─── SQLi Detection ──────────────────────────────────────────────────────────
@@ -1034,21 +1716,26 @@ def _is_boolean_sqli(baseline, true_response, false_response):
     false_text = false_response.text
 
     # 1. SQL error in either response → immediate detection
-    if _contains_sql_error(true_text) or _contains_sql_error(false_text):
+    baseline_has_error = baseline is not None and _contains_sql_error(baseline.text)
+    if not baseline_has_error and (
+        _contains_sql_error(true_text) or _contains_sql_error(false_text)
+    ):
         return True, "Une réponse contient une erreur SQL."
 
-    # 2. Status code divergence
-    if true_response.status_code != false_response.status_code:
-        if true_response.status_code < 500 and false_response.status_code >= 400:
-            return (
-                True,
-                "Le payload vrai est accepté alors que le payload faux est rejeté.",
-            )
-        if true_response.status_code < 500 and false_response.status_code >= 500:
-            return (
-                True,
-                "Le payload faux provoque une erreur serveur alors que le payload vrai est accepté.",
-            )
+    # 2. Status divergence is useful only if the true branch still resembles
+    # the normal response. Otherwise this is likely ordinary input validation.
+    if (
+        baseline is not None
+        and true_response.status_code == baseline.status_code
+        and false_response.status_code >= 400
+        and true_response.status_code != false_response.status_code
+        and _similar(true_response.text, baseline.text) > 0.75
+        and _similar(false_response.text, baseline.text) < 0.65
+    ):
+        return (
+            True,
+            "Le payload vrai reproduit la réponse normale alors que le payload faux est rejeté.",
+        )
 
     true_len = len(true_text)
     false_len = len(false_text)
@@ -1163,7 +1850,7 @@ def _sqli_error_payloads(original):
 
 # ─── UNION-based SQLi ────────────────────────────────────────────────────────
 
-def _test_union_sqli(session, candidate, original, timeout):
+def _test_union_sqli(session, candidate, original, timeout, max_columns=6):
     """Test for UNION-based SQL injection.
 
     Strategy:
@@ -1174,10 +1861,20 @@ def _test_union_sqli(session, candidate, original, timeout):
     original = str(original or "1")
     marker = f"SQLI_{uuid.uuid4().hex[:6]}"
 
+    # If a plain value is reflected, the marker in a UNION response would not
+    # prove database extraction. Skip UNION confirmation for that candidate.
+    try:
+        reflection_control = _send_candidate(session, candidate, marker, timeout)
+        marker_reflects = marker in reflection_control.text
+    except requests.exceptions.RequestException:
+        marker_reflects = False
+
     # Phase 1: Determine column count via ORDER BY
     # Reduced max columns and permutations for speed
     col_count = 0
-    for n in range(1, 8):
+    # Probe one position beyond the desired maximum so a failure at N+1 can
+    # confirm an N-column query.
+    for n in range(1, max(2, max_columns) + 2):
         for prefix in (
             f"{original}' ORDER BY {n}-- -",
             f"{original} ORDER BY {n}-- -",
@@ -1220,7 +1917,7 @@ def _test_union_sqli(session, candidate, original, timeout):
                 if _is_auth_redirect(resp, candidate["url"]):
                     continue
 
-                if marker in resp.text:
+                if marker in resp.text and not marker_reflects:
                     return (
                         True,
                         f"UNION SELECT avec {nc} colonne(s) extrait des données. "
@@ -1265,6 +1962,18 @@ def _test_time_sqli(session, candidate, original, timeout, baseline_time):
 
         extra_delay = elapsed - baseline_time
         if extra_delay >= TIME_THRESHOLD:
+            # Confirm against a fresh control to reject a one-off network spike.
+            try:
+                _, control_elapsed = _timed_send(
+                    session, candidate, original, timeout
+                )
+                _, confirmation_elapsed = _timed_send(
+                    session, candidate, payload, timeout
+                )
+            except requests.exceptions.RequestException:
+                continue
+            if confirmation_elapsed - control_elapsed < TIME_THRESHOLD:
+                continue
             return (
                 True,
                 f"Le payload temporel a provoqué un délai de {elapsed:.1f}s "
@@ -1290,9 +1999,11 @@ def _insert_once(
 # ─── Main Entry Point ────────────────────────────────────────────────────────
 
 def tester_injections(url_cible, options=None, _ctx=None):
-    """Discover and test GET/POST inputs for reflected XSS and SQL injection.
+    """Discover and test inputs for DOM/reflected XSS and SQL injection.
 
     Detection methods:
+    - DOM XSS: harmless side-effect payload executed in headless Chromium, with
+      source/sink analysis of JavaScript bundles as a lower-confidence fallback.
     - XSS: Reflected payload detection with canary pre-check, expanded payloads,
       HTML-decoded reflection check, and event handler detection.
     - SQLi Error-based: Break-string payloads that trigger SQL error messages.
@@ -1303,6 +2014,7 @@ def tester_injections(url_cible, options=None, _ctx=None):
     options = options or {}
     root = normalize_target_url(url_cible)
     crawl_root = get_scope_root(url_cible)
+    depth_config = get_depth_config(options)
     def _opt(key, env_key, default):
         """Resolve option value, handling 0 correctly (0 is a valid value, not falsy)."""
         val = options.get(key)
@@ -1313,10 +2025,26 @@ def tester_injections(url_cible, options=None, _ctx=None):
             return int(env_val)
         return default
 
-    timeout = _opt("timeout", "SCANNER_TIMEOUT", DEFAULT_TIMEOUT)
-    max_pages = _opt("max_pages", "SCANNER_MAX_PAGES", DEFAULT_MAX_PAGES)
-    max_candidates = _opt("max_candidates", "SCANNER_MAX_CANDIDATES", DEFAULT_MAX_CANDIDATES)
-    max_time_probes = _opt("max_time_probes", "SCANNER_MAX_TIME_PROBES", DEFAULT_MAX_TIME_PROBES)
+    timeout = _opt("timeout", "SCANNER_TIMEOUT", depth_config["timeout"])
+    max_pages = _opt("max_pages", "SCANNER_MAX_PAGES", depth_config["max_pages"])
+    max_candidates = _opt(
+        "max_candidates", "SCANNER_MAX_CANDIDATES", depth_config["max_candidates"]
+    )
+    max_time_probes = _opt(
+        "max_time_probes",
+        "SCANNER_MAX_TIME_PROBES",
+        depth_config["max_time_probes"],
+    )
+    max_scripts = int(options.get("max_scripts", depth_config["fuzzer_max_scripts"]))
+    max_error_payloads = int(
+        options.get("max_error_payloads", depth_config["max_error_payloads"])
+    )
+    max_boolean_pairs = int(
+        options.get("max_boolean_pairs", depth_config["max_boolean_pairs"])
+    )
+    max_union_columns = int(
+        options.get("max_union_columns", depth_config["max_union_columns"])
+    )
 
     print(f"[*] Démarrage des tests d'injection sur : {root}")
     if crawl_root != root:
@@ -1346,6 +2074,7 @@ def tester_injections(url_cible, options=None, _ctx=None):
             timeout,
             max_pages,
             max_candidates,
+            max_scripts,
         )
         print(
             f"  [i] Candidats XSS: {len(xss_candidates)} | Candidats SQLi: {len(sqli_candidates)}"
@@ -1356,6 +2085,49 @@ def tester_injections(url_cible, options=None, _ctx=None):
 
         # ── Phase 1: XSS ─────────────────────────────────────────────────
         print("  [>] Phase 1 : Test XSS...")
+
+        # Fragment-based SPA routes never reach the HTTP server, so validate
+        # them separately in a real browser DOM before response reflection tests.
+        dom_findings = _detect_dom_xss(
+            session, url_cible, crawl_root, timeout, options
+        )
+        for finding in dom_findings:
+            if finding.get("confirmed"):
+                description = (
+                    f"Le paramètre '{finding['param']}' de la route {finding['route']} permet "
+                    f"l'exécution de JavaScript dans le DOM. La vulnérabilité a été confirmée "
+                    f"dans {finding['browser']} par {finding.get('confirmation', 'un marqueur DOM')}."
+                )
+                type_faille = "Injection XSS (DOM)"
+                severity = "Élevé"
+                key = ("dom_xss", finding["route"], finding["param"])
+                log_detail = f"{finding['route']} param={finding['param']} (exécution confirmée)"
+            else:
+                description = (
+                    "L'analyse statique du bundle JavaScript a identifié une source contrôlée "
+                    f"par l'URL ('{finding['source']}') reliée à un puits HTML dangereux "
+                    f"('{finding['sink']}') dans {finding['script']}. Une validation manuelle "
+                    "dans le navigateur reste nécessaire."
+                )
+                type_faille = "Risque XSS (DOM, analyse statique)"
+                severity = "Moyen"
+                key = ("dom_xss_static", finding["script"], finding["sink"])
+                log_detail = f"{finding['script']} (analyse statique)"
+
+            if _insert_once(
+                cursor,
+                scan_id,
+                inserted,
+                key,
+                type_faille,
+                severity,
+                description,
+                "Ne jamais injecter directement une valeur provenant de l'URL dans innerHTML. Utiliser l'encodage contextuel, les liaisons texte du framework et une Content-Security-Policy restrictive; éviter les API de contournement de la sanitisation.",
+            ):
+                findings += 1
+                print(f"  [+] XSS DOM détectée: {log_detail}")
+
+        xss_browser = _find_chromium_browser(options)
         for candidate in xss_candidates:
             # Step 1: Quick canary check — if the input doesn't reflect at all,
             # skip all payloads for this candidate (huge speed improvement).
@@ -1372,11 +2144,29 @@ def tester_injections(url_cible, options=None, _ctx=None):
                 if _is_auth_redirect(response, candidate["url"]):
                     break  # No point testing more payloads if auth-redirected
 
-                if _contains_raw_xss(response.text, payload):
+                if _contains_raw_xss(
+                    response.text,
+                    payload,
+                    response.headers.get("Content-Type", ""),
+                ):
                     path = urlparse(candidate["url"]).path or "/"
+                    browser_confirmed = _run_reflected_xss_probe(
+                        xss_browser, candidate, timeout
+                    )
+                    severity = "Élevé" if browser_confirmed else "Moyen"
+                    finding_type = (
+                        "Injection XSS (Réfléchie)"
+                        if browser_confirmed
+                        else "Risque XSS réfléchi (non confirmé)"
+                    )
+                    validation = (
+                        "L'exécution a été confirmée dans un navigateur headless."
+                        if browser_confirmed
+                        else "La réflexion HTML est confirmée; une validation navigateur manuelle est recommandée."
+                    )
                     description = (
                         f"Le paramètre '{candidate['param']}' reflète du HTML/JavaScript non échappé "
-                        f"sur {candidate['method'].upper()} {path}. Cela permet l'exécution de script côté navigateur."
+                        f"sur {candidate['method'].upper()} {path}. {validation}"
                     )
                     key = (
                         "xss",
@@ -1389,8 +2179,8 @@ def tester_injections(url_cible, options=None, _ctx=None):
                         scan_id,
                         inserted,
                         key,
-                        "Injection XSS (Réfléchie)",
-                        "Élevé",
+                        finding_type,
+                        severity,
                         description,
                         "Encoder toutes les sorties HTML, valider les entrées côté serveur, éviter l'insertion directe dans le DOM et déployer une Content-Security-Policy restrictive.",
                     ):
@@ -1408,7 +2198,10 @@ def tester_injections(url_cible, options=None, _ctx=None):
         time_probes_used = 0
 
         for candidate in sqli_candidates:
-            original = candidate.get("base_data", {}).get(candidate["param"], "1")
+            original = candidate.get("base_data", {}).get(
+                candidate["param"],
+                candidate.get("base_params", {}).get(candidate["param"], "1"),
+            )
 
             # Get baseline response
             baseline = None
@@ -1419,13 +2212,18 @@ def tester_injections(url_cible, options=None, _ctx=None):
                 )
             except requests.exceptions.RequestException:
                 pass
+            if baseline is None:
+                continue
 
             detected = False
             evidence = ""
             method_name = ""
+            baseline_sql_error = (
+                baseline is not None and _contains_sql_error(baseline.text)
+            )
 
             # ── 2a: Error-based SQLi ──────────────────────────────────────
-            for error_payload in _sqli_error_payloads(original):
+            for error_payload in _sqli_error_payloads(original)[:max_error_payloads]:
                 try:
                     error_response = _send_candidate(
                         session, candidate, error_payload, timeout
@@ -1435,33 +2233,49 @@ def tester_injections(url_cible, options=None, _ctx=None):
                 if _is_auth_redirect(error_response, candidate["url"]):
                     break
                 baseline_status = baseline.status_code if baseline is not None else 200
-                if _contains_sql_error(error_response.text):
+                if (
+                    _contains_sql_error(error_response.text)
+                    and not baseline_sql_error
+                ):
+                    try:
+                        confirmation = _send_candidate(
+                            session, candidate, error_payload, timeout
+                        )
+                    except requests.exceptions.RequestException:
+                        continue
+                    if not _contains_sql_error(confirmation.text):
+                        continue
                     detected = True
-                    evidence = "Un payload de rupture de chaîne provoque une erreur SQL visible."
-                    method_name = "Error-based"
+                    evidence = (
+                        "Le même payload de rupture de chaîne provoque deux fois "
+                        "une erreur SQL visible."
+                    )
+                    method_name = "Error-based (confirmé deux fois)"
                     break
                 if baseline_status < 500 and error_response.status_code >= 500:
-                    # A 500 triggered by a SQL-breaking payload is suspicious,
-                    # but only confirmed if the body contains SQL error strings.
-                    if _contains_sql_error(error_response.text):
-                        detected = True
-                        evidence = "Un payload de rupture de chaîne provoque une erreur serveur contenant des messages SQL."
-                        method_name = "Error-based"
-                    else:
-                        # Generic 500 without SQL error — could be WAF, input
-                        # validation, or framework error.  Report as possible.
-                        detected = True
-                        evidence = (
-                            "Un payload de rupture de chaîne provoque une erreur serveur (HTTP 500). "
-                            "Aucun message SQL explicite n'a été détecté dans la réponse — "
-                            "il peut s'agir d'une injection SQL non confirmée ou d'une erreur de validation."
+                    # Generic 500 without SQL evidence could be WAF/input
+                    # validation. Repeat it before reporting a lower-confidence risk.
+                    try:
+                        confirmation = _send_candidate(
+                            session, candidate, error_payload, timeout
                         )
-                        method_name = "Error-based (non confirmé)"
+                    except requests.exceptions.RequestException:
+                        continue
+                    if confirmation.status_code < 500:
+                        continue
+                    detected = True
+                    evidence = (
+                        "Le même payload de rupture de chaîne provoque deux fois une erreur serveur (HTTP 500). "
+                        "Aucun message SQL explicite n'a été détecté dans la réponse — "
+                        "il peut s'agir d'une injection SQL non confirmée ou d'une erreur de validation."
+                    )
+                    method_name = "Error-based (non confirmé)"
                     break
 
             # ── 2b: Boolean-based SQLi ────────────────────────────────────
             if not detected:
-                for true_payload, false_payload in _sqli_payload_pairs(original):
+                pairs = _sqli_payload_pairs(original)[:max_boolean_pairs]
+                for true_payload, false_payload in pairs:
                     try:
                         true_response = _send_candidate(
                             session, candidate, true_payload, timeout
@@ -1481,13 +2295,34 @@ def tester_injections(url_cible, options=None, _ctx=None):
                         baseline, true_response, false_response
                     )
                     if detected:
-                        method_name = "Boolean-based"
-                        break
+                        # Confirm once to reject dynamic pages and transient
+                        # response differences.
+                        try:
+                            confirm_true = _send_candidate(
+                                session, candidate, true_payload, timeout
+                            )
+                            confirm_false = _send_candidate(
+                                session, candidate, false_payload, timeout
+                            )
+                            confirmed, confirm_evidence = _is_boolean_sqli(
+                                baseline, confirm_true, confirm_false
+                            )
+                        except requests.exceptions.RequestException:
+                            confirmed, confirm_evidence = False, ""
+                        if confirmed:
+                            evidence = f"{evidence} Confirmation: {confirm_evidence}"
+                            method_name = "Boolean-based (confirmé deux fois)"
+                            break
+                        detected = False
 
             # ── 2c: UNION-based SQLi ──────────────────────────────────────
             if not detected:
                 detected, evidence = _test_union_sqli(
-                    session, candidate, original, timeout
+                    session,
+                    candidate,
+                    original,
+                    timeout,
+                    max_columns=max_union_columns,
                 )
                 if detected:
                     method_name = "UNION-based"
@@ -1508,8 +2343,10 @@ def tester_injections(url_cible, options=None, _ctx=None):
                 # is downgraded to Moyen — it could be WAF/validation, not real SQLi.
                 if "non confirmé" in method_name:
                     severity = "Moyen"
+                    finding_type = "Risque d'injection SQL (non confirmé)"
                 else:
                     severity = "Critique"
+                    finding_type = "Injection SQL (SQLi)"
                 description = (
                     f"Le paramètre '{candidate['param']}' semble influencer une requête SQL sur "
                     f"{candidate['method'].upper()} {path}. "
@@ -1527,7 +2364,7 @@ def tester_injections(url_cible, options=None, _ctx=None):
                     scan_id,
                     inserted,
                     key,
-                    "Injection SQL (SQLi)",
+                    finding_type,
                     severity,
                     description,
                     "Utiliser des requêtes préparées/paramétrées, éviter toute concaténation SQL avec l'entrée utilisateur, valider les types attendus et limiter les privilèges du compte base de données.",

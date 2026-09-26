@@ -5,6 +5,8 @@ from urllib.parse import urlparse, urlunparse
 
 import requests
 import urllib3
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # SSL verification is intentionally disabled to allow scanning local/self-signed
 # targets (DVWA, bWAPP, Juice Shop, etc.). Suppress the per-request noise.
@@ -18,6 +20,69 @@ DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
 }
+
+SCAN_DEPTH_PROFILES = {
+    "light": {
+        "timeout": 5,
+        "fuzzer_workers": 6,
+        "fuzzer_max_paths": 90,
+        "fuzzer_recursive_dirs": 3,
+        "fuzzer_max_scripts": 3,
+        "max_pages": 6,
+        "max_candidates": 25,
+        "max_time_probes": 0,
+        "max_dom_routes": 1,
+        "max_error_payloads": 4,
+        "max_boolean_pairs": 4,
+        "max_union_columns": 4,
+    },
+    "standard": {
+        "timeout": 8,
+        "fuzzer_workers": 10,
+        "fuzzer_max_paths": 320,
+        "fuzzer_recursive_dirs": 10,
+        "fuzzer_max_scripts": 6,
+        "max_pages": 15,
+        "max_candidates": 80,
+        "max_time_probes": 3,
+        "max_dom_routes": 4,
+        "max_error_payloads": 8,
+        "max_boolean_pairs": 9,
+        "max_union_columns": 6,
+    },
+    "deep": {
+        "timeout": 12,
+        "fuzzer_workers": 14,
+        "fuzzer_max_paths": 650,
+        "fuzzer_recursive_dirs": 25,
+        "fuzzer_max_scripts": 12,
+        "max_pages": 35,
+        "max_candidates": 180,
+        "max_time_probes": 8,
+        "max_dom_routes": 10,
+        "max_error_payloads": 12,
+        "max_boolean_pairs": 19,
+        "max_union_columns": 8,
+    },
+}
+
+
+def get_scan_depth(options=None):
+    """Return the normalized UI scan depth (light, standard, or deep)."""
+    options = options or {}
+    value = (
+        options.get("depth")
+        or options.get("scan_depth")
+        or os.getenv("SCANNER_DEPTH")
+        or "standard"
+    )
+    value = str(value).strip().lower()
+    return value if value in SCAN_DEPTH_PROFILES else "standard"
+
+
+def get_depth_config(options=None):
+    """Return a copy of the limits associated with the requested scan depth."""
+    return dict(SCAN_DEPTH_PROFILES[get_scan_depth(options)])
 
 
 def normalize_target_url(url):
@@ -98,6 +163,18 @@ def build_session(options=None):
     session.headers.update(DEFAULT_HEADERS)
     # Disable SSL verification for local test environments (DVWA, bWAPP, etc.)
     session.verify = False
+    retry = Retry(
+        total=1,
+        connect=1,
+        read=1,
+        status=0,
+        backoff_factor=0.15,
+        allowed_methods=frozenset({"HEAD", "GET", "OPTIONS"}),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
 
     cookie_header = (
         options.get("cookie_header")
@@ -108,9 +185,14 @@ def build_session(options=None):
     for key, value in parse_cookie_header(cookie_header).items():
         session.cookies.set(key, value)
 
-    # Support explicit security level (e.g., DVWA security=low)
-    security_level = options.get("security_level") or options.get("securityLevel") or ""
-    if security_level:
+    # DVWA's security cookie is separate from the UI scan depth.  Older builds
+    # accidentally sent light/standard/deep as a DVWA cookie value.
+    security_level = (
+        options.get("dvwa_security_level")
+        or os.getenv("SCANNER_DVWA_SECURITY_LEVEL")
+        or ""
+    )
+    if str(security_level).lower() in {"low", "medium", "high", "impossible"}:
         session.cookies.set("security", security_level)
 
     return session

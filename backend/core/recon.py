@@ -1,3 +1,4 @@
+import re
 from urllib.parse import urlparse
 
 try:
@@ -6,6 +7,7 @@ try:
         build_session,
         connect_db,
         finish_scan,
+        get_depth_config,
         normalize_target_url,
         start_scan,
     )
@@ -15,6 +17,7 @@ except ImportError:
         build_session,
         connect_db,
         finish_scan,
+        get_depth_config,
         normalize_target_url,
         start_scan,
     )
@@ -84,11 +87,18 @@ COOKIE_SECURITY_FLAGS = {
 }
 
 
-def _check_security_headers(response, cursor, scan_id):
+def _check_security_headers(response, cursor, scan_id, is_https=False):
     """Check for missing security headers."""
     headers = response.headers
     findings = 0
     for header, details in SECURITY_HEADERS.items():
+        if header == "Strict-Transport-Security" and not is_https:
+            continue
+        if (
+            header == "X-Frame-Options"
+            and "frame-ancestors" in headers.get("Content-Security-Policy", "").lower()
+        ):
+            continue
         if header not in headers:
             add_vulnerability(
                 cursor,
@@ -248,7 +258,130 @@ def _check_cors_misconfiguration(response, cursor, scan_id):
     return findings
 
 
-def _check_error_page_disclosure(session, base_url, cursor, scan_id):
+def _check_csp_quality(response, cursor, scan_id):
+    """Detect CSP directives that significantly weaken script protection."""
+    policy = response.headers.get("Content-Security-Policy", "")
+    if not policy:
+        return 0
+    lowered = policy.lower()
+    weaknesses = []
+    if "'unsafe-inline'" in lowered:
+        weaknesses.append("unsafe-inline")
+    if "'unsafe-eval'" in lowered:
+        weaknesses.append("unsafe-eval")
+    if re.search(r"(?:default-src|script-src)[^;]*\*", lowered):
+        weaknesses.append("source joker (*)")
+    if not weaknesses:
+        return 0
+    add_vulnerability(
+        cursor,
+        scan_id,
+        "Content-Security-Policy faible",
+        "Moyen",
+        "La politique CSP autorise des comportements dangereux : "
+        + ", ".join(weaknesses)
+        + ". Elle réduit insuffisamment l'impact d'une injection XSS.",
+        "Supprimer unsafe-eval, remplacer unsafe-inline par des nonces/hachages et limiter script-src aux origines strictement nécessaires.",
+    )
+    print(f"  [!] CSP faible ({', '.join(weaknesses)}) -> Classé: Moyen")
+    return 1
+
+
+def _check_active_cors(session, target_url, cursor, scan_id, timeout):
+    """Send an untrusted Origin and verify whether the server reflects it."""
+    evil_origin = "https://scanforge.invalid"
+    try:
+        response = session.get(
+            target_url,
+            headers={"Origin": evil_origin},
+            timeout=timeout,
+            allow_redirects=True,
+        )
+    except Exception:
+        return 0
+    allowed = response.headers.get("Access-Control-Allow-Origin", "").strip()
+    credentials = response.headers.get("Access-Control-Allow-Credentials", "").lower()
+    if allowed != evil_origin:
+        return 0
+    severity = "Élevé" if credentials == "true" else "Moyen"
+    add_vulnerability(
+        cursor,
+        scan_id,
+        "CORS avec origine arbitraire réfléchie",
+        severity,
+        f"Le serveur recopie l'origine non fiable '{evil_origin}' dans Access-Control-Allow-Origin"
+        + (" et autorise les identifiants." if credentials == "true" else "."),
+        "Valider l'en-tête Origin avec une liste blanche exacte et ne jamais activer les identifiants pour une origine arbitraire.",
+    )
+    print(f"  [!] Origine CORS arbitraire réfléchie -> Classé: {severity}")
+    return 1
+
+
+def _check_dangerous_methods(session, target_url, cursor, scan_id, timeout):
+    """Inspect advertised HTTP methods and actively validate TRACE."""
+    try:
+        response = session.options(target_url, timeout=timeout, allow_redirects=False)
+    except Exception:
+        return 0
+    allowed = {
+        method.strip().upper()
+        for method in response.headers.get("Allow", "").split(",")
+        if method.strip()
+    }
+    findings = 0
+    if "TRACE" in allowed:
+        try:
+            trace = session.request(
+                "TRACE", target_url, timeout=timeout, allow_redirects=False
+            )
+        except Exception:
+            trace = None
+        if trace is not None and trace.status_code < 400:
+            add_vulnerability(
+                cursor,
+                scan_id,
+                "Méthode HTTP TRACE activée",
+                "Moyen",
+                f"Le serveur accepte TRACE (HTTP {trace.status_code}), ce qui peut faciliter certaines attaques de diagnostic ou Cross-Site Tracing.",
+                "Désactiver TRACE au niveau du serveur web ou du proxy inverse.",
+            )
+            findings += 1
+    write_methods = sorted(allowed.intersection({"PUT", "DELETE", "CONNECT"}))
+    if write_methods:
+        add_vulnerability(
+            cursor,
+            scan_id,
+            "Méthodes HTTP sensibles annoncées",
+            "Faible",
+            "L'en-tête Allow annonce les méthodes sensibles suivantes : "
+            + ", ".join(write_methods)
+            + ". Leur contrôle d'accès doit être vérifié.",
+            "N'autoriser que les méthodes nécessaires et appliquer une authentification/autorisation stricte aux opérations de modification.",
+        )
+        findings += 1
+    return findings
+
+
+def _check_mixed_content(response, cursor, scan_id, is_https):
+    if not is_https or "html" not in response.headers.get("Content-Type", "").lower():
+        return 0
+    insecure = re.findall(
+        r"(?:src|href)\s*=\s*[\"']http://[^\"']+", response.text, re.IGNORECASE
+    )
+    if not insecure:
+        return 0
+    add_vulnerability(
+        cursor,
+        scan_id,
+        "Contenu mixte HTTP/HTTPS",
+        "Moyen",
+        f"La page HTTPS charge {len(insecure)} ressource(s) via HTTP, ce qui permet leur interception ou leur blocage par le navigateur.",
+        "Servir toutes les ressources via HTTPS et utiliser des URL relatives ou explicitement sécurisées.",
+    )
+    return 1
+
+
+def _check_error_page_disclosure(session, base_url, cursor, scan_id, timeout=8):
     """Send a bad request and check if error pages leak information."""
     findings = 0
     # Try a few error-triggering paths
@@ -269,7 +402,7 @@ def _check_error_page_disclosure(session, base_url, cursor, scan_id):
     for path in error_paths:
         try:
             url = f"{base_url.rstrip('/')}{path}"
-            resp = session.get(url, timeout=8, allow_redirects=True)
+            resp = session.get(url, timeout=timeout, allow_redirects=True)
 
             # Only check 4xx/5xx error pages
             if resp.status_code < 400:
@@ -301,6 +434,9 @@ def _check_error_page_disclosure(session, base_url, cursor, scan_id):
 
 
 def analyser_en_tetes(url, options=None, _ctx=None):
+    options = options or {}
+    depth_config = get_depth_config(options)
+    timeout = int(options.get("timeout", depth_config["timeout"]))
     print(f"[*] Démarrage de la reconnaissance passive sur : {url}")
 
     if _ctx:
@@ -318,25 +454,38 @@ def analyser_en_tetes(url, options=None, _ctx=None):
             target_url = normalize_target_url(url)
 
         session = build_session(options)
-        response = session.get(target_url, timeout=10, allow_redirects=True)
+        response = session.get(target_url, timeout=timeout, allow_redirects=True)
 
         findings = 0
+        is_https = urlparse(target_url).scheme == "https"
 
         # Check 1: Missing security headers (original)
-        findings += _check_security_headers(response, cursor, scan_id)
+        findings += _check_security_headers(
+            response, cursor, scan_id, is_https=is_https
+        )
 
         # Check 2: Server/technology version disclosure (NEW)
         findings += _check_version_disclosure(response, cursor, scan_id)
 
         # Check 3: Cookie security flags (NEW)
-        is_https = urlparse(target_url).scheme == "https"
         findings += _check_cookie_security(response, cursor, scan_id, is_https=is_https)
 
         # Check 4: CORS misconfiguration (NEW)
         findings += _check_cors_misconfiguration(response, cursor, scan_id)
+        findings += _check_active_cors(
+            session, target_url, cursor, scan_id, timeout
+        )
+
+        findings += _check_csp_quality(response, cursor, scan_id)
+        findings += _check_dangerous_methods(
+            session, target_url, cursor, scan_id, timeout
+        )
+        findings += _check_mixed_content(response, cursor, scan_id, is_https)
 
         # Check 5: Error page information disclosure (NEW)
-        findings += _check_error_page_disclosure(session, target_url, cursor, scan_id)
+        findings += _check_error_page_disclosure(
+            session, target_url, cursor, scan_id, timeout
+        )
 
         if not _ctx:
             finish_scan(conn, cursor, scan_id, "Terminé")

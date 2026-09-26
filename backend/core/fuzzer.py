@@ -1,9 +1,10 @@
 import os
 import re
-import time
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from difflib import SequenceMatcher
-from urllib.parse import urlparse
+from urllib.parse import urldefrag, urljoin, urlparse
 
 import requests
 
@@ -13,7 +14,9 @@ try:
         build_session,
         connect_db,
         finish_scan,
+        get_depth_config,
         get_scope_root,
+        same_origin,
         start_scan,
     )
 except ImportError:
@@ -22,7 +25,9 @@ except ImportError:
         build_session,
         connect_db,
         finish_scan,
+        get_depth_config,
         get_scope_root,
+        same_origin,
         start_scan,
     )
 
@@ -65,7 +70,7 @@ INTERESTING_HINTS = {
     "graphiql",
     "playground",
     "actuator",
-    # Juice Shop / CTF hints
+    # Operational and intentionally hidden application areas
     "ftp",
     "encryptionkeys",
     "metrics",
@@ -134,6 +139,27 @@ BENIGN_PUBLIC_HINTS = {
     "humans.txt",
     "favicon.ico",
 }
+
+EXPOSURE_PATH_HINTS = (
+    "admin",
+    "backup",
+    "config",
+    "console",
+    "database",
+    "debug",
+    "dump",
+    "encryptionkeys",
+    "ftp",
+    "internal",
+    "logs",
+    "metrics",
+    "phpinfo",
+    "private",
+    "secret",
+    "server-status",
+    "setup",
+    "actuator",
+)
 
 
 def _join_url(root, path):
@@ -263,17 +289,23 @@ def _is_soft_404(response, baselines, word):
     # unknown paths as 4xx.  Any 4xx we get is therefore not a real finding.
     # This catches Vercel (403), Cloudflare Pages (403), standard 404, etc.
     if status in (401, 403, 404, 410) and probes:
-        # Classic: exact same status as a probe
-        if any(probe["status"] == status for probe in probes):
-            return True
+        # Matching a status code alone is insufficient: a real protected path
+        # can return 403 while random paths return a different generic 403 page.
+        for probe in probes:
+            if probe["status"] != status:
+                continue
+            if _similar(fp["compact"], probe["compact"]) > 0.72:
+                return True
+            if (
+                fp["title"]
+                and fp["title"] == probe["title"]
+                and abs(fp["length"] - probe["length"])
+                <= max(80, probe["length"] * 0.15)
+            ):
+                return True
 
         # All probes are 4xx → server returns errors for missing pages;
         # the specific code varies but they are all "not found" semantically.
-        all_probes_4xx = all(400 <= probe["status"] < 500 for probe in probes)
-        if all_probes_4xx:
-            print(f"  [~] Soft-404 (all probes 4xx, got {status}): /{word}")
-            return True
-
     # ── 2. Cross-status body comparison for 401/403 ─────────────────
     # Even when probe status differs (e.g. probes got 404 but we got 403),
     # if the response body looks like the probe body, it's a generic error.
@@ -343,52 +375,186 @@ def _is_soft_404(response, baselines, word):
     return False
 
 
+def _discover_paths(session, root, timeout, max_scripts):
+    """Collect same-origin paths disclosed by HTML, robots, sitemaps and JS."""
+    paths = set()
+    script_urls = []
+
+    def add_url(value, base=root):
+        if not value or value.startswith(("data:", "mailto:", "javascript:")):
+            return
+        absolute, _ = urldefrag(urljoin(base.rstrip("/") + "/", value))
+        if not same_origin(absolute, root):
+            return
+        parsed = urlparse(absolute)
+        path = parsed.path.strip("/")
+        if path and len(path) <= 220 and "{" not in path:
+            paths.add(path)
+
+    try:
+        home = session.get(root.rstrip("/") + "/", timeout=timeout, allow_redirects=True)
+        for attr, value in re.findall(
+            r"\b(href|src|action)\s*=\s*[\"']([^\"']+)",
+            home.text,
+            flags=re.IGNORECASE,
+        ):
+            add_url(value, home.url)
+            if attr.lower() == "src" and ".js" in value.lower():
+                script_url = urljoin(home.url, value)
+                if same_origin(script_url, root):
+                    script_urls.append(script_url)
+    except requests.exceptions.RequestException:
+        pass
+
+    for metadata_path in ("robots.txt", "sitemap.xml"):
+        try:
+            response = session.get(
+                _join_url(root, metadata_path), timeout=timeout, allow_redirects=True
+            )
+        except requests.exceptions.RequestException:
+            continue
+        if response.status_code >= 400:
+            continue
+        if metadata_path == "robots.txt":
+            for value in re.findall(
+                r"^(?:allow|disallow|sitemap)\s*:\s*(\S+)",
+                response.text,
+                flags=re.IGNORECASE | re.MULTILINE,
+            ):
+                add_url(value, response.url)
+        else:
+            for value in re.findall(r"<loc>\s*(.*?)\s*</loc>", response.text, re.I):
+                add_url(value, response.url)
+
+    js_path_pattern = re.compile(
+        r"[\"'`](\/[^\"'`\s<>]{1,220})[\"'`]"
+    )
+    total_bytes = 0
+    for script_url in list(dict.fromkeys(script_urls))[:max_scripts]:
+        try:
+            response = session.get(script_url, timeout=timeout, allow_redirects=True)
+        except requests.exceptions.RequestException:
+            continue
+        if response.status_code >= 400:
+            continue
+        total_bytes += len(response.content)
+        if total_bytes > 15_000_000:
+            break
+        source = response.text.replace("\\/", "/")
+        for match in js_path_pattern.finditer(source):
+            add_url(match.group(1).split("?", 1)[0], script_url)
+
+    backup_variants = set()
+    for path in paths:
+        name = path.rsplit("/", 1)[-1]
+        if "." in name and not name.endswith((".map", ".min.js")):
+            backup_variants.update(
+                {f"{path}.bak", f"{path}.old", f"{path}~", f"{path}.save"}
+            )
+    return list(paths | backup_variants)
+
+
+def _probe_paths(paths, target_url, options, timeout, workers):
+    """Fetch path candidates concurrently with one session per worker thread."""
+    local_state = threading.local()
+
+    def probe(word):
+        if not hasattr(local_state, "session"):
+            local_state.session = build_session(options)
+        try:
+            response = local_state.session.get(
+                _join_url(target_url, word), timeout=timeout, allow_redirects=False
+            )
+            return word, response
+        except requests.exceptions.RequestException:
+            return word, None
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        futures = [executor.submit(probe, word) for word in paths]
+        for future in as_completed(futures):
+            word, response = future.result()
+            if response is not None:
+                results[word] = response
+    return results
+
+
 def _is_interesting_path(word):
     lowered = word.lower().strip("/")
     if lowered in BENIGN_PUBLIC_HINTS:
         return False
     if any(hint in lowered for hint in SENSITIVE_FILE_HINTS):
         return True
-    return any(
-        part in INTERESTING_HINTS for part in lowered.replace(".", "/").split("/")
+    parts = lowered.replace(".", "/").replace("-", "/").split("/")
+    return any(part in INTERESTING_HINTS for part in parts) or any(
+        hint in lowered for hint in INTERESTING_HINTS if len(hint) >= 5
     )
 
 
 def _classify(word, status_code, content_type="", response_text=""):
+    """Classify only evidence-backed exposures, not every successful JSON page."""
     lowered = word.lower()
-    is_sensitive_file = any(hint in lowered for hint in SENSITIVE_FILE_HINTS)
-
-    # Check if response contains JSON data (API endpoint leaking data)
+    body = (response_text or "").lower()
+    is_sensitive_file = any(hint.lower() in lowered for hint in SENSITIVE_FILE_HINTS)
+    sensitive_signatures = (
+        "password", "passwd", "api_key", "apikey", "access_token",
+        "client_secret", "private key", "database_url", "aws_secret",
+        "begin rsa private key", "begin openssh private key",
+    )
+    has_sensitive_content = any(signature in body for signature in sensitive_signatures)
+    is_directory_listing = (
+        "index of /" in body
+        or "directory listing for" in body
+        or ("parent directory" in body and "<a href=" in body)
+    )
     is_json = "json" in content_type.lower()
-    has_data = False
-    if is_json and response_text:
-        # JSON responses with actual data arrays/objects indicate data exposure
-        lowered_resp = response_text.lower()
-        has_data = any(
-            indicator in lowered_resp
-            for indicator in ['"data"', '"results"', '"items"', '"users"', '"email"',
-                              '"password"', '"token"', '"id":', '"name":',
-                              '"createdAt"', '"updatedAt"']
+    has_sensitive_path = any(hint in lowered for hint in EXPOSURE_PATH_HINTS)
+    has_sensitive_json = is_json and any(
+        key in body
+        for key in (
+            '"password"', '"token"', '"secret"', '"api_key"',
+            '"access_token"', '"email"', '"users"',
         )
+    )
 
-    if status_code == 200 and is_sensitive_file:
+    # Authentication and authorization are protections, not vulnerabilities.
+    # Keep these routes in console discovery output but do not count them as
+    # security findings solely because they exist.
+    if status_code != 200:
+        return None, None
+    if is_sensitive_file and has_sensitive_content:
         return "Élevé", "Fichier sensible exposé"
-    if status_code == 200 and is_json and has_data:
-        return "Élevé", "Endpoint API exposant des données"
-    if status_code == 200 and (
-        "ftp" in lowered or "encryptionkeys" in lowered or "backup" in lowered
+    if is_directory_listing:
+        return "Élevé", "Indexation de répertoire activée"
+    if has_sensitive_json:
+        return "Élevé", "Endpoint API exposant des données sensibles"
+    if is_sensitive_file:
+        return "Moyen", "Fichier potentiellement sensible accessible"
+    if any(
+        hint in lowered for hint in ("backup", "dump", "encryptionkeys", "private")
     ):
-        return "Élevé", "Répertoire sensible accessible"
-    if status_code == 200:
+        return "Élevé", "Ressource sensible accessible"
+    if has_sensitive_path:
         return "Moyen", "Chemin sensible accessible"
-    if status_code in (401, 403):
-        return "Faible", "Chemin sensible présent mais accès restreint"
-    if status_code in (301, 302, 307, 308):
-        return "Faible", "Redirection détectée vers un chemin sensible"
-    return "Faible", "Chemin intéressant détecté"
+    # A public JSON endpoint or a generic successful route is not a
+    # vulnerability without sensitive content or a security-relevant path.
+    return None, None
 
 
 def decouvrir_contenu(url_cible, options=None, _ctx=None):
+    options = options or {}
+    depth_config = get_depth_config(options)
+    timeout = int(options.get("timeout", depth_config["timeout"]))
+    workers = int(options.get("fuzzer_workers", depth_config["fuzzer_workers"]))
+    max_paths = int(options.get("fuzzer_max_paths", depth_config["fuzzer_max_paths"]))
+    max_scripts = int(
+        options.get("fuzzer_max_scripts", depth_config["fuzzer_max_scripts"])
+    )
+    recursive_limit = int(
+        options.get(
+            "fuzzer_recursive_dirs", depth_config["fuzzer_recursive_dirs"]
+        )
+    )
     root = get_scope_root(url_cible)
     print(f"[*] Démarrage du fuzzing sur : {root}")
 
@@ -408,6 +574,20 @@ def decouvrir_contenu(url_cible, options=None, _ctx=None):
 
         words = _read_wordlist()
         session = build_session(options)
+        discovered_paths = _discover_paths(
+            session, target_url, timeout, max_scripts
+        )
+        dynamic_priority = [
+            path for path in discovered_paths if _is_interesting_path(path)
+        ]
+        dynamic_other = [
+            path for path in discovered_paths if path not in dynamic_priority
+        ]
+        words = list(dict.fromkeys(dynamic_priority + words + dynamic_other))[:max_paths]
+        print(
+            f"  [i] {len(discovered_paths)} chemin(s) découverts dans HTML/JS/robots; "
+            f"{len(words)} chemin(s) testés avec {workers} workers."
+        )
 
         # Build robust baselines: multiple random probes + homepage fingerprint
         baselines = _build_baselines(session, target_url)
@@ -419,6 +599,7 @@ def decouvrir_contenu(url_cible, options=None, _ctx=None):
 
         # VALID_STATUS: now includes redirects (301, 302, 307, 308)
         valid_statuses = {200, 201, 204, 301, 302, 307, 308, 401, 403}
+        responses = _probe_paths(words, target_url, options, timeout, workers)
 
         for word in words:
             if word in seen:
@@ -428,9 +609,8 @@ def decouvrir_contenu(url_cible, options=None, _ctx=None):
             # Test ALL paths from wordlist, not just "interesting" ones.
             # Classify severity AFTER we get a response.
             url_test = _join_url(target_url, word)
-            try:
-                response = session.get(url_test, timeout=5, allow_redirects=False)
-            except requests.exceptions.RequestException:
+            response = responses.get(word)
+            if response is None:
                 continue
 
             if response.status_code not in valid_statuses:
@@ -451,6 +631,8 @@ def decouvrir_contenu(url_cible, options=None, _ctx=None):
                 continue
 
             severity, finding_type = _classify(word, response.status_code, content_type, response.text)
+            if not severity:
+                continue
 
             # For redirects, note the redirect target
             redirect_info = ""
@@ -484,7 +666,6 @@ def decouvrir_contenu(url_cible, options=None, _ctx=None):
             if response.status_code == 200 and "/" not in word:
                 discovered_dirs.append(word)
 
-            time.sleep(0.03)
 
         # ── Recursive sub-path probing ──────────────────────────────
         # For discovered directories, try common sub-paths
@@ -493,7 +674,7 @@ def decouvrir_contenu(url_cible, options=None, _ctx=None):
             "search", "login", "users", "admin", "config", "info",
         ]
 
-        for parent_dir in discovered_dirs[:20]:  # Limit to avoid explosion
+        for parent_dir in discovered_dirs[:recursive_limit]:
             for subpath in recursive_subpaths:
                 combined = f"{parent_dir}/{subpath}"
                 if combined in seen:
@@ -502,7 +683,7 @@ def decouvrir_contenu(url_cible, options=None, _ctx=None):
 
                 url_test = _join_url(target_url, combined)
                 try:
-                    response = session.get(url_test, timeout=5, allow_redirects=False)
+                    response = session.get(url_test, timeout=timeout, allow_redirects=False)
                 except requests.exceptions.RequestException:
                     continue
 
@@ -513,6 +694,8 @@ def decouvrir_contenu(url_cible, options=None, _ctx=None):
 
                 content_type = response.headers.get("Content-Type", "").split(";", 1)[0]
                 severity, finding_type = _classify(combined, response.status_code, content_type, response.text)
+                if not severity:
+                    continue
 
                 description = (
                     f"Le sous-chemin '/{combined}' (découvert récursivement) répond avec HTTP {response.status_code} "
@@ -535,7 +718,6 @@ def decouvrir_contenu(url_cible, options=None, _ctx=None):
                 findings += 1
                 print(f"  [+] HTTP {response.status_code}: {url_test} -> {severity} (récursif)")
 
-                time.sleep(0.03)
 
         if not _ctx:
             finish_scan(conn, cursor, scan_id, "Terminé")

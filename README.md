@@ -1,6 +1,6 @@
-# Vulnerability Scanner
+# ScanForge
 
-Professional web vulnerability scanner with a Flask backend, a React dashboard, and a SQLite data store. The project is designed for controlled testing of authorized targets and focuses on a practical workflow for reconnaissance, content discovery, and injection testing.
+ScanForge is a professional web vulnerability scanner with a Flask backend, a React dashboard, and a SQLite data store. The project is designed for controlled testing of authorized targets and focuses on a practical workflow for reconnaissance, content discovery, and injection testing.
 
 ## Overview
 
@@ -19,9 +19,16 @@ The codebase is split into three main layers:
 
 ## Key Features
 
-- Passive HTTP security header analysis.
-- Directory and hidden content discovery using wordlist-based fuzzing.
-- Reflected XSS and SQL injection checks against forms and parameters.
+- HTTP reconnaissance covering headers, CSP quality, CORS behavior, cookies,
+  risky methods, version disclosure, error leakage, and mixed content.
+- Concurrent hidden-content discovery from a wordlist plus HTML, JavaScript,
+  `robots.txt`, and sitemap evidence, with soft-404 filtering. Protected routes
+  and ordinary public APIs are not counted as vulnerabilities without evidence.
+- Generic input discovery from links, forms, JavaScript, OpenAPI/Swagger, and
+  common API conventions, including specifications embedded by Swagger UI.
+- Reflected XSS and DOM XSS checks with browser confirmation, plus error-,
+  boolean-, UNION-, and time-based SQL injection checks.
+- Light, standard, and deep scan profiles with bounded requests and timeouts.
 - Session-aware scanning support for authenticated targets via cookies.
 - SQLite-backed scan history, target tracking, and vulnerability storage.
 - Dashboard views for scan summaries, recent activity, and severity breakdowns.
@@ -31,9 +38,10 @@ The codebase is split into three main layers:
 The scanner is orchestrated by the Flask API in `backend/API.py`.
 
 - `backend/core/common.py` handles URL normalization, session creation, and database helpers.
-- `backend/core/recon.py` performs passive recon on security headers.
-- `backend/core/fuzzer.py` discovers hidden paths and sensitive endpoints.
-- `backend/core/payloads.py` tests injection vectors for XSS and SQLi.
+- `backend/core/recon.py` checks HTTP security posture and selected active
+  configuration behaviors.
+- `backend/core/fuzzer.py` discovers and validates hidden paths and sensitive endpoints.
+- `backend/core/payloads.py` discovers inputs and tests XSS and SQLi vectors.
 - `frontend/src/App.jsx` renders the scan dashboard and communicates with the API.
 
 ## Requirements
@@ -41,6 +49,7 @@ The scanner is orchestrated by the Flask API in `backend/API.py`.
 - Python 3.10 or newer.
 - Node.js 18 or newer.
 - npm.
+- Google Chrome, Chromium, or Microsoft Edge for dynamic DOM-XSS validation.
 
 ## Setup
 
@@ -84,7 +93,7 @@ By default, the frontend expects the backend to be available at `http://127.0.0.
 3. Open the dashboard in your browser.
 4. Enter an authorized target URL.
 5. Confirm that you are authorized to test the target.
-6. Optionally provide a cookie header or security level for authenticated environments.
+6. Select the desired scan depth and optionally provide a session cookie.
 7. Launch the scan and monitor results from the dashboard.
 
 ## Supported Test Targets
